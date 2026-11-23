@@ -377,6 +377,36 @@ def _restart_services(stopped: object) -> None:
 
 CATEGORY_ORDER = ["Windows", "Navigateurs", "Applications", "Développement"]
 
+# Applications dont les fichiers sont verrouillés tant qu'elles sont ouvertes.
+RUNNING_APPS: dict[str, tuple[str, tuple[str, ...]]] = {
+    "chrome": ("Google Chrome", ("chrome.exe",)),
+    "edge": ("Microsoft Edge", ("msedge.exe",)),
+    "brave": ("Brave", ("brave.exe",)),
+    "vivaldi": ("Vivaldi", ("vivaldi.exe",)),
+    "opera": ("Opera", ("opera.exe", "opera_gx.exe")),
+    "firefox": ("Firefox", ("firefox.exe",)),
+    "discord": ("Discord", ("discord.exe", "discordptb.exe", "discordcanary.exe")),
+    "teams_classic": ("Microsoft Teams", ("teams.exe",)),
+    "steam": ("Steam", ("steam.exe", "steamwebhelper.exe")),
+    "spotify_cache": ("Spotify", ("spotify.exe",)),
+    "vscode": ("Visual Studio Code", ("code.exe",)),
+}
+
+
+def running_blockers(target_ids: list[str]) -> list[str]:
+    """Noms des applications ouvertes qui empêcheront de nettoyer entièrement les cibles choisies."""
+    import psutil
+
+    wanted = {tid: RUNNING_APPS[tid] for tid in target_ids if tid in RUNNING_APPS}
+    if not wanted:
+        return []
+    running = set()
+    for proc in psutil.process_iter(["name"]):
+        name = (proc.info.get("name") or "").lower()
+        if name:
+            running.add(name)
+    return [label for label, exes in wanted.values() if any(exe in running for exe in exes)]
+
 
 def build_targets() -> list[CleanTarget]:
     """Liste de toutes les cibles connues (celles absentes du PC seront simplement vides)."""
@@ -431,6 +461,9 @@ def build_targets() -> list[CleanTarget]:
                     r"Fichiers .log anciens de C:\Windows\Logs (plus de 7 jours).",
                     lambda: _existing(windir / "Logs"), admin=True, default=False,
                     patterns=("*.log", "*.old", "*.etl"), min_age_hours=24 * 7),
+        CleanTarget("app_downloads", "Installateurs téléchargés par NPone29 Cleaner", "Windows",
+                    "Pilotes téléchargés (ex. NVIDIA) déjà installés — plus d'un jour.",
+                    lambda: _existing(local / "NPone29Cleaner" / "downloads"), min_age_hours=24),
         CleanTarget("recent_files", "Liste des documents récents", "Windows",
                     "Raccourcis « Récents » de l'Explorateur (confidentialité).",
                     lambda: _existing(roaming / "Microsoft" / "Windows" / "Recent"),

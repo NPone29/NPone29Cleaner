@@ -35,6 +35,7 @@ class InstalledDriver:
     inf_name: str
     is_signed: bool
     device_id: str = ""
+    hardware_id: str = ""
 
     @property
     def is_microsoft(self) -> bool:
@@ -64,6 +65,7 @@ class DriverUpdate:
     size: int
     optional: bool
     description: str = ""
+    hardware_id: str = ""
 
 
 @dataclass
@@ -202,7 +204,7 @@ def get_hardware_vendors() -> dict[str, str]:
 def _query_installed_drivers() -> list[InstalledDriver]:
     rows = _wmi().ExecQuery(
         "SELECT DeviceName, DeviceClass, Manufacturer, DriverProviderName, DriverVersion, "
-        "DriverDate, InfName, IsSigned, DeviceID FROM Win32_PnPSignedDriver"
+        "DriverDate, InfName, IsSigned, DeviceID, HardWareID FROM Win32_PnPSignedDriver"
     )
     found: list[InstalledDriver] = []
     for row in rows:
@@ -219,6 +221,7 @@ def _query_installed_drivers() -> list[InstalledDriver]:
             inf_name=_str(row.InfName),
             is_signed=bool(row.IsSigned),
             device_id=_str(row.DeviceID),
+            hardware_id=_str(row.HardWareID),
         ))
     found.sort(key=lambda d: d.device_name.lower())
     return found
@@ -242,10 +245,13 @@ def _query_problem_devices() -> list[ProblemDevice]:
 
 def _query_hardware_vendors() -> dict[str, str]:
     wmi = _wmi()
-    result = {"system": "", "model": "", "gpus": ""}
+    result = {"system": "", "model": "", "gpus": "", "board_maker": "", "board_product": ""}
     for row in wmi.ExecQuery("SELECT Manufacturer, Model FROM Win32_ComputerSystem"):
         result["system"] = _str(row.Manufacturer)
         result["model"] = _str(row.Model)
+    for row in wmi.ExecQuery("SELECT Manufacturer, Product FROM Win32_BaseBoard"):
+        result["board_maker"] = _str(row.Manufacturer)
+        result["board_product"] = _str(row.Product)
     gpus = [_str(r.Name) for r in wmi.ExecQuery("SELECT Name FROM Win32_VideoController")]
     result["gpus"] = " | ".join(g for g in gpus if g)
     return result
@@ -330,6 +336,7 @@ class WindowsUpdateDriverService:
                                             initializer=_com_init)
         self._session = None
         self._updates: dict[str, object] = {}  # objets COM, utilisés uniquement dans le thread dédié
+        self.last_results: list[DriverUpdate] | None = None  # dernière recherche (lecture seule)
 
     def shutdown(self) -> None:
         self._executor.shutdown(wait=False, cancel_futures=True)
@@ -374,8 +381,10 @@ class WindowsUpdateDriverService:
                 size=int(_get(upd, "MaxDownloadSize", 0) or 0),
                 optional=bool(_get(upd, "BrowseOnly", False)),
                 description=_str(_get(upd, "Description", "")),
+                hardware_id=_str(_get(upd, "DriverHardwareID", "")),
             ))
         log.info("Windows Update : %d pilote(s) disponible(s)", len(found))
+        self.last_results = found
         return found
 
     def _install(self, update_ids: list[str], progress) -> InstallReport:
@@ -433,6 +442,7 @@ class WindowsUpdateDriverService:
 
         # Les pilotes installés ne doivent plus apparaître à la prochaine recherche.
         self._updates.clear()
+        self.last_results = None
         return report
 
 

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import tkinter as tk
+import tkinter.font as tkfont
 import weakref
 from tkinter import messagebox, ttk
 from typing import Any, Callable, Iterable
@@ -344,3 +345,225 @@ def show_error(parent, title: str, message: str) -> None:
 
 def show_warning(parent, title: str, message: str) -> None:
     messagebox.showwarning(title, message, parent=parent.winfo_toplevel())
+
+
+# --------------------------------------------------------------------------- aide à l'utilisateur
+
+LEVEL_COLORS = {
+    "success": theme.SUCCESS, "ok": theme.SUCCESS, "info": theme.ACCENT,
+    "warning": theme.WARNING, "warn": theme.WARNING, "error": theme.DANGER,
+}
+LEVEL_SYMBOLS = {"success": "✓", "ok": "✓", "info": "i", "warning": "!", "warn": "!", "error": "✕"}
+
+_ICON_FAMILY: str | None = None
+# Le « ✓ » de Segoe UI est trop large pour tenir dans un cercle : on prend celui de la police d'icônes.
+_ICON_SYMBOLS = {"✓": "\ue73e", "✕": "\ue711"}
+
+
+def icon_family() -> str:
+    global _ICON_FAMILY
+    if _ICON_FAMILY is None:
+        try:
+            families = set(tkfont.families())
+        except tk.TclError:
+            families = set()
+        _ICON_FAMILY = next((f for f in ("Segoe Fluent Icons", "Segoe MDL2 Assets") if f in families), "")
+    return _ICON_FAMILY
+
+
+class Badge(ctk.CTkLabel):
+    """Pastille ronde (numéro d'étape, ✓, !, i…).
+
+    CustomTkinter ajoute de chaque côté du texte une marge égale au rayon des coins,
+    ce qui transforme un cercle en ovale : on la supprime.
+    """
+
+    def _create_grid(self):
+        super()._create_grid()
+        self._label.grid_configure(padx=0)
+
+
+def symbol(sym: str, size: int):
+    """Texte + police pour afficher un symbole centré dans une pastille ronde."""
+    family = icon_family()
+    if sym in _ICON_SYMBOLS and family:
+        return _ICON_SYMBOLS[sym], (family, max(8, size - 2))
+    return sym, theme.font(size, "bold")
+
+
+class Stepper(ctk.CTkFrame):
+    """Indicateur d'étapes : ① Analyser — ② Choisir — ③ Nettoyer — ④ Terminé."""
+
+    def __init__(self, master, steps: list[str]):
+        super().__init__(master, fg_color="transparent")
+        self._items: list[tuple[ctk.CTkLabel, ctk.CTkLabel]] = []
+        self._lines: list[ctk.CTkFrame] = []
+        for i, label in enumerate(steps):
+            box = ctk.CTkFrame(self, fg_color="transparent")
+            box.grid(row=0, column=i * 2, sticky="w")
+            circle = Badge(box, text=str(i + 1), width=26, height=26, corner_radius=13,
+                                  font=theme.font(12, "bold"))
+            circle.pack(side="left")
+            text = ctk.CTkLabel(box, text=label, font=theme.font(12))
+            text.pack(side="left", padx=(6, 0))
+            self._items.append((circle, text))
+            if i < len(steps) - 1:
+                line = ctk.CTkFrame(self, height=2, width=34, fg_color=theme.CARD_BORDER)
+                line.grid(row=0, column=i * 2 + 1, padx=8)
+                self._lines.append(line)
+        self.current = 0
+        self.set(0)
+
+    def set(self, current: int) -> None:
+        """`current` = index de l'étape en cours ; len(steps) = tout est terminé."""
+        self.current = current
+        for i, (circle, text) in enumerate(self._items):
+            if i < current:
+                text_sym, font = symbol("✓", 12)
+                circle.configure(text=text_sym, font=font, fg_color=theme.SUCCESS, text_color="#ffffff")
+                text.configure(text_color=theme.NEUTRAL_TEXT, font=theme.font(12))
+            elif i == current:
+                circle.configure(text=str(i + 1), font=theme.font(12, "bold"), fg_color=theme.ACCENT,
+                                 text_color="#ffffff")
+                text.configure(text_color=theme.NEUTRAL_TEXT, font=theme.font(12, "bold"))
+            else:
+                circle.configure(text=str(i + 1), font=theme.font(12, "bold"), fg_color=theme.NEUTRAL_BTN,
+                                 text_color=theme.MUTED)
+                text.configure(text_color=theme.MUTED, font=theme.font(12))
+        for i, line in enumerate(self._lines):
+            line.configure(fg_color=theme.SUCCESS if i < current else theme.CARD_BORDER)
+
+
+class TipBox(ctk.CTkFrame):
+    """Encadré d'explication pour guider l'utilisateur."""
+
+    def __init__(self, master, text: str, level: str = "info"):
+        super().__init__(master, fg_color=("#eef4ff", "#1c2638") if level == "info" else ("#fff4e5", "#33291a"),
+                         corner_radius=10)
+        color = LEVEL_COLORS.get(level, theme.ACCENT)
+        Badge(self, text=LEVEL_SYMBOLS.get(level, "i"), width=22, height=22, corner_radius=11,
+                     fg_color=color, text_color="#ffffff", font=theme.font(12, "bold")) \
+            .pack(side="left", padx=(12, 8), pady=10, anchor="n")
+        self.label = ctk.CTkLabel(self, text=text, font=theme.font(12), anchor="w", justify="left", wraplength=780)
+        self.label.pack(side="left", fill="x", expand=True, padx=(0, 12), pady=9)
+        self.bind("<Configure>", self._rewrap, add="+")
+
+    def _rewrap(self, event) -> None:
+        scaling = ctk.ScalingTracker.get_widget_scaling(self)
+        self.label.configure(wraplength=max(200, int(event.width / scaling) - 70))
+
+    def set_text(self, text: str) -> None:
+        self.label.configure(text=text)
+
+
+class Toast(ctk.CTkFrame):
+    """Notification affichée quelques secondes en haut à droite de l'application."""
+
+    DURATION_MS = 7000
+
+    def __init__(self, master, title: str, message: str, level: str = "success",
+                 action: tuple[str, Callable[[], None]] | None = None,
+                 on_close: Callable[["Toast"], None] | None = None):
+        super().__init__(master, fg_color=theme.CARD, corner_radius=12, border_width=2,
+                         border_color=LEVEL_COLORS.get(level, theme.ACCENT))
+        self._on_close = on_close
+        self._closed = False
+        color = LEVEL_COLORS.get(level, theme.ACCENT)
+        sym, sym_font = symbol(LEVEL_SYMBOLS.get(level, "i"), 14)
+        Badge(self, text=sym, width=28, height=28, corner_radius=14, fg_color=color,
+                     text_color="#ffffff", font=sym_font) \
+            .grid(row=0, column=0, rowspan=3, padx=(14, 10), pady=14, sticky="n")
+        ctk.CTkLabel(self, text=title, font=theme.font(14, "bold"), anchor="w", justify="left",
+                     wraplength=260).grid(row=0, column=1, sticky="w", pady=(12, 0))
+        ctk.CTkLabel(self, text=message, font=theme.font(12), text_color=theme.MUTED, anchor="w", justify="left",
+                     wraplength=270).grid(row=1, column=1, sticky="w", pady=(2, 4 if action else 12))
+        if action:
+            ctk.CTkButton(self, text=action[0], height=28, width=10, font=theme.font(12, "bold"),
+                          fg_color=theme.ACCENT, hover_color=theme.ACCENT_HOVER,
+                          command=lambda: (action[1](), self.close())).grid(row=2, column=1, sticky="w", pady=(0, 12))
+        ctk.CTkButton(self, text="✕", width=26, height=26, fg_color="transparent", hover_color=theme.NEUTRAL_BTN,
+                      text_color=theme.MUTED, command=self.close).grid(row=0, column=2, padx=8, pady=8, sticky="ne")
+        self.after(self.DURATION_MS, self.close)
+
+    def close(self) -> None:
+        if self._closed:
+            return
+        self._closed = True
+        if self._on_close:
+            self._on_close(self)
+        try:
+            self.destroy()
+        except tk.TclError:
+            pass
+
+
+class ResultDialog(ctk.CTkToplevel):
+    """Fenêtre de bilan : résultat, chiffres clés, conseils et prochaines étapes proposées."""
+
+    def __init__(self, parent, title: str, headline: str, stats: list[tuple[str, str]] | None = None,
+                 tips: list[str] | None = None, actions: list[tuple[str, Callable[[], None]]] | None = None,
+                 level: str = "success", close_text: str = "Fermer", actions_title: str = "Et maintenant ?"):
+        super().__init__(parent)
+        self.withdraw()
+        self.title(title)
+        self.configure(fg_color=theme.WINDOW_BG)
+        self.resizable(False, False)
+        self.transient(parent.winfo_toplevel())
+
+        body = ctk.CTkFrame(self, fg_color="transparent")
+        body.pack(fill="both", expand=True, padx=28, pady=24)
+        color = LEVEL_COLORS.get(level, theme.SUCCESS)
+        sym, sym_font = symbol(LEVEL_SYMBOLS.get(level, "✓"), 26)
+        Badge(body, text=sym, width=56, height=56, corner_radius=28, fg_color=color,
+                     text_color="#ffffff", font=sym_font).pack()
+        ctk.CTkLabel(body, text=headline, font=theme.font(18, "bold"), wraplength=440, justify="center") \
+            .pack(pady=(12, 14))
+
+        if stats:
+            card = Card(body)
+            card.pack(fill="x", pady=(0, 12))
+            card.grid_columnconfigure(1, weight=1)
+            last = len(stats) - 1
+            for r, (label, value) in enumerate(stats):
+                pad = (10 if r == 0 else 3, 10 if r == last else 3)
+                ctk.CTkLabel(card, text=label, font=theme.font(13), text_color=theme.MUTED, anchor="w") \
+                    .grid(row=r, column=0, sticky="w", padx=(16, 12), pady=pad)
+                ctk.CTkLabel(card, text=value, font=theme.font(13, "bold"), anchor="e") \
+                    .grid(row=r, column=1, sticky="e", padx=(12, 16), pady=pad)
+        for tip in tips or []:
+            ctk.CTkLabel(body, text=f"•  {tip}", font=theme.font(12), text_color=theme.MUTED, anchor="w",
+                         justify="left", wraplength=440).pack(fill="x", pady=2)
+
+        if actions:
+            ctk.CTkLabel(body, text=actions_title, font=theme.font(14, "bold"), anchor="w") \
+                .pack(fill="x", pady=(14, 6))
+            for label, callback in actions:
+                ctk.CTkButton(body, text=label, height=34, font=theme.font(13), anchor="w",
+                              fg_color=theme.NEUTRAL_BTN, hover_color=theme.NEUTRAL_BTN_HOVER,
+                              text_color=theme.NEUTRAL_TEXT,
+                              command=lambda cb=callback: (self.destroy(), cb())).pack(fill="x", pady=3)
+        ctk.CTkButton(body, text=close_text, height=36, font=theme.font(13, "bold"), fg_color=theme.ACCENT,
+                      hover_color=theme.ACCENT_HOVER, command=self.destroy).pack(fill="x", pady=(16, 0))
+
+        self.update_idletasks()
+        top = parent.winfo_toplevel()
+        x = top.winfo_rootx() + (top.winfo_width() - self.winfo_reqwidth()) // 2
+        y = top.winfo_rooty() + (top.winfo_height() - self.winfo_reqheight()) // 3
+        self.geometry(f"+{max(0, x)}+{max(0, y)}")
+        self.deiconify()
+        self.after(250, self._finish)
+
+    def _finish(self) -> None:
+        from app.utils.paths import resource_path
+
+        icon = resource_path("assets/icon.ico")
+        if icon.exists():
+            try:
+                self.iconbitmap(str(icon))
+            except Exception:
+                pass
+        try:
+            self.grab_set()
+            self.focus_force()
+        except tk.TclError:
+            pass

@@ -7,7 +7,7 @@ import customtkinter as ctk
 from app.core import sysinfo
 from app.ui import theme
 from app.ui.pages.base import Page
-from app.ui.widgets import Card, PageHeader, primary_button
+from app.ui.widgets import Card, PageHeader, neutral_button, primary_button
 from app.utils.fmt import format_duration, human_size
 
 
@@ -21,22 +21,42 @@ class DashboardPage(Page):
         self.grid_columnconfigure((0, 1), weight=1, uniform="col")
 
         PageHeader(self, "Tableau de bord", "Vue d'ensemble de votre PC et accès rapide à l'entretien.") \
-            .grid(row=0, column=0, columnspan=2, sticky="w", pady=(0, 16))
+            .grid(row=0, column=0, columnspan=2, sticky="w", pady=(0, 14))
+
+        # ---- Entretien guidé (action recommandée)
+        hero = ctk.CTkFrame(self, fg_color=theme.ACCENT, corner_radius=14)
+        hero.grid(row=1, column=0, columnspan=2, sticky="ew", pady=(0, 12))
+        hero.grid_columnconfigure(0, weight=1)
+        ctk.CTkLabel(hero, text="Entretien guidé", font=theme.font(20, "bold"), text_color="#ffffff",
+                     anchor="w").grid(row=0, column=0, sticky="w", padx=22, pady=(18, 0))
+        last = self.settings.get("last_maintenance")
+        sub_text = ("Nettoyage, pilotes, logiciels et démarrage vérifiés en une seule fois. "
+                    "Rien n'est modifié sans votre accord.")
+        if last:
+            sub_text += f"\nDernier entretien : {last}"
+        self.hero_text = ctk.CTkLabel(hero, text=sub_text, font=theme.font(13), text_color="#e0e7ff", anchor="w",
+                                      justify="left", wraplength=560)
+        self.hero_text.grid(row=1, column=0, sticky="w", padx=22, pady=(2, 18))
+        ctk.CTkButton(hero, text="▶  Démarrer", width=150, height=42, corner_radius=10, font=theme.font(15, "bold"),
+                      fg_color="#ffffff", hover_color="#e0e7ff", text_color="#1d4ed8",
+                      command=lambda: self._goto("assistant", "start")).grid(row=0, column=1, rowspan=2, padx=22)
 
         # ---- Actions rapides
         actions = Card(self)
-        actions.grid(row=1, column=0, columnspan=2, sticky="ew", pady=(0, 14))
-        actions.grid_columnconfigure((0, 1, 2), weight=1, uniform="a")
+        actions.grid(row=2, column=0, columnspan=2, sticky="ew", pady=(0, 12))
+        actions.grid_columnconfigure((0, 1, 2, 3), weight=1, uniform="a")
         self._action(actions, 0, "Nettoyer le PC", "Fichiers temporaires, caches, corbeille…",
                      "Analyser", lambda: self._goto("cleaner", "start_scan"))
-        self._action(actions, 1, "Pilotes", "Recherche des pilotes à mettre à jour.",
-                     "Rechercher", lambda: self._goto("drivers", "start_search"))
+        self._action(actions, 1, "Pilotes", "Analyse de tous les pilotes et sites officiels.",
+                     "Analyser", lambda: self._goto("drivers", "start_analysis"))
         self._action(actions, 2, "Logiciels", "Mises à jour de vos applications.",
                      "Vérifier", lambda: self._goto("software", "start_search"))
+        self._action(actions, 3, "Mon PC", "La carte de votre matériel, expliquée simplement.",
+                     "Découvrir", lambda: self.app.show_page("hardware"), neutral=True)
 
         # ---- Système
         self.sys_card = Card(self)
-        self.sys_card.grid(row=2, column=0, sticky="nsew", padx=(0, 7))
+        self.sys_card.grid(row=3, column=0, sticky="nsew", padx=(0, 7))
         ctk.CTkLabel(self.sys_card, text="Système", font=theme.font(16, "bold")).pack(anchor="w", padx=18, pady=(16, 8))
         self.sys_rows = ctk.CTkFrame(self.sys_card, fg_color="transparent")
         self.sys_rows.pack(fill="x", padx=18, pady=(0, 16))
@@ -44,7 +64,7 @@ class DashboardPage(Page):
 
         # ---- Utilisation en direct
         usage = Card(self)
-        usage.grid(row=2, column=1, sticky="nsew", padx=(7, 0))
+        usage.grid(row=3, column=1, sticky="nsew", padx=(7, 0))
         ctk.CTkLabel(usage, text="Utilisation", font=theme.font(16, "bold")).pack(anchor="w", padx=18, pady=(16, 8))
         self.cpu_label, self.cpu_bar = self._meter(usage, "Processeur")
         self.ram_label, self.ram_bar = self._meter(usage, "Mémoire vive")
@@ -52,17 +72,17 @@ class DashboardPage(Page):
         self.disk_frame = ctk.CTkFrame(usage, fg_color="transparent")
         self.disk_frame.pack(fill="x", padx=18, pady=(0, 16))
 
-        self.grid_rowconfigure(3, weight=1)
+        self.grid_rowconfigure(4, weight=1)
         self._load_static()
 
     # ------------------------------------------------------------------ construction
-    def _action(self, parent, col, title, text, button, command) -> None:
+    def _action(self, parent, col, title, text, button, command, neutral: bool = False) -> None:
         box = ctk.CTkFrame(parent, fg_color="transparent")
-        box.grid(row=0, column=col, sticky="nsew", padx=18, pady=16)
+        box.grid(row=0, column=col, sticky="nsew", padx=16, pady=14)
         ctk.CTkLabel(box, text=title, font=theme.font(15, "bold"), anchor="w").pack(anchor="w")
         ctk.CTkLabel(box, text=text, font=theme.font(12), text_color=theme.MUTED, anchor="w",
-                     wraplength=240, justify="left").pack(anchor="w", pady=(2, 10))
-        primary_button(box, button, command, width=130).pack(anchor="w")
+                     wraplength=190, justify="left", height=36).pack(anchor="w", pady=(2, 8))
+        (neutral_button if neutral else primary_button)(box, button, command, width=120).pack(anchor="w")
 
     def _meter(self, parent, title):
         frame = ctk.CTkFrame(parent, fg_color="transparent")

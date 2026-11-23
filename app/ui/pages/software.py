@@ -10,8 +10,11 @@ from app.core import software
 from app.core.software import SoftwareUpdate
 from app.ui import theme
 from app.ui.pages.base import Page
-from app.ui.widgets import PageHeader, StatusLine, Table, ask_yes_no, neutral_button, primary_button, success_button
+from app.ui.widgets import (PageHeader, ResultDialog, StatusLine, Stepper, Table, ask_yes_no, neutral_button,
+                            primary_button, success_button)
 from app.utils.system import open_url
+
+STEPS = ["Rechercher", "Choisir", "Mettre à jour", "Terminé"]
 
 
 class SoftwarePage(Page):
@@ -24,15 +27,18 @@ class SoftwarePage(Page):
         self.cancel = threading.Event()
 
         self.grid_columnconfigure(0, weight=1)
-        self.grid_rowconfigure(2, weight=3)
-        self.grid_rowconfigure(3, weight=1)
+        self.grid_rowconfigure(3, weight=3)
+        self.grid_rowconfigure(4, weight=1)
 
         PageHeader(self, "Logiciels",
                    "Mettez à jour vos applications en un clic grâce à winget, le gestionnaire de paquets "
-                   "officiel de Windows (sources vérifiées).").grid(row=0, column=0, sticky="ew", pady=(0, 14))
+                   "officiel de Windows (sources vérifiées).").grid(row=0, column=0, sticky="ew", pady=(0, 10))
+
+        self.stepper = Stepper(self, STEPS)
+        self.stepper.grid(row=1, column=0, sticky="w", pady=(0, 12))
 
         bar = ctk.CTkFrame(self, fg_color="transparent")
-        bar.grid(row=1, column=0, sticky="ew", pady=(0, 10))
+        bar.grid(row=2, column=0, sticky="ew", pady=(0, 10))
         self.search_btn = primary_button(bar, "Rechercher", self.start_search, width=130)
         self.search_btn.pack(side="left")
         self.update_btn = success_button(bar, "Mettre à jour la sélection", self.start_upgrade, width=210)
@@ -46,15 +52,16 @@ class SoftwarePage(Page):
             ("available", "Nouvelle version", 140, "w", False),
             ("status", "État", 150, "w", False),
         ], checkable=True)
-        self.table.grid(row=2, column=0, sticky="nsew")
+        self.table.grid(row=3, column=0, sticky="nsew")
 
         self.log = ctk.CTkTextbox(self, height=110, font=("Consolas", 11), fg_color=theme.CARD,
                                   border_width=1, border_color=theme.CARD_BORDER, corner_radius=10)
-        self.log.grid(row=3, column=0, sticky="nsew", pady=(10, 0))
+        self.log.grid(row=4, column=0, sticky="nsew", pady=(10, 0))
+        self.log.insert("end", "Le journal des mises à jour s'affichera ici.\n")
         self.log.configure(state="disabled")
 
         self.status = StatusLine(self)
-        self.status.grid(row=4, column=0, sticky="ew", pady=(10, 0))
+        self.status.grid(row=5, column=0, sticky="ew", pady=(10, 0))
 
         if software.winget_path():
             self.status.set_text("Cliquez sur « Rechercher » pour lister les logiciels à mettre à jour.")
@@ -90,18 +97,30 @@ class SoftwarePage(Page):
         if self.busy:
             return
         self._set_busy(True)
+        self.stepper.set(0)
         self.table.clear()
         self.status.busy("Recherche des mises à jour avec winget…")
-        self.dispatcher.run(software.list_upgrades, on_done=self._search_done,
+        self.dispatcher.run(software.list_upgrades, on_done=self.show_updates,
                             on_error=lambda e: self.status.idle(f"Recherche impossible : {e}"),
                             on_finally=lambda: self._set_busy(False))
 
-    def _search_done(self, updates: list[SoftwareUpdate]) -> None:
+    def show_updates(self, updates: list[SoftwareUpdate], notify: bool = True) -> None:
+        """Affiche la liste (aussi appelée par l'entretien guidé)."""
         self.updates = {u.id: u for u in updates}
         rows = [(u.id, [u.name, u.id, u.version, u.available, "Disponible"], None, ()) for u in updates]
         self.table.set_rows(rows, checked=[u.id for u in updates])
-        self.status.idle(f"{len(updates)} mise(s) à jour disponible(s)." if updates
-                         else "✓ Tous vos logiciels sont à jour.")
+        if updates:
+            self.stepper.set(1)
+            self.status.idle(f"Étape 2 : {len(updates)} mise(s) à jour disponible(s). Décochez celles que vous ne "
+                             "voulez pas, puis cliquez sur « Mettre à jour la sélection ».")
+        else:
+            self.stepper.set(len(STEPS))
+            self.status.idle("✓ Tous vos logiciels sont à jour.")
+        if notify:
+            self.app.notify("Recherche terminée",
+                            f"{len(updates)} logiciel(s) à mettre à jour." if updates else "Tous vos logiciels sont à jour.",
+                            "warning" if updates else "success",
+                            action=("Voir", lambda: self.app.show_page("software")) if updates else None)
 
     # ------------------------------------------------------------------ mise à jour
     def start_upgrade(self) -> None:
@@ -118,6 +137,7 @@ class SoftwarePage(Page):
             return
         self.cancel.clear()
         self._set_busy(True, upgrading=True)
+        self.stepper.set(2)
         items = [self.updates[i] for i in ids]
         progress = self.dispatcher.wrap(self._on_progress)
 
@@ -159,3 +179,15 @@ class SoftwarePage(Page):
     def _upgrade_done(self, counts: tuple[int, int]) -> None:
         ok, fail = counts
         self.status.idle(f"Terminé : {ok} mis à jour, {fail} échec(s).")
+        self.stepper.set(len(STEPS))
+        self.app.notify("Mises à jour terminées", f"{ok} logiciel(s) mis à jour, {fail} échec(s).",
+                        "success" if not fail else "warning")
+        tips = []
+        if fail:
+            tips.append("Un échec vient souvent d'un logiciel ouvert pendant la mise à jour : fermez-le et réessayez.")
+            tips.append("Certains logiciels (ex. Microsoft Store, jeux) se mettent à jour par eux-mêmes.")
+        ResultDialog(self, "Mises à jour terminées", f"{ok} logiciel(s) mis à jour",
+                     [("Réussies", str(ok)), ("Échecs", str(fail))], tips,
+                     actions=[("Relancer la recherche", self.start_search),
+                              ("Vérifier les pilotes", lambda: self.app.show_page("drivers").start_analysis())],
+                     level="success" if not fail else "warning")

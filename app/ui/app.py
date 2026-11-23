@@ -11,17 +11,20 @@ import customtkinter as ctk
 from app.config import APP_NAME, APP_VERSION
 from app.core.drivers import WindowsUpdateDriverService
 from app.ui import theme
+from app.ui.pages.assistant import AssistantPage
 from app.ui.pages.base import Page
 from app.ui.pages.bigfiles import BigFilesPage
 from app.ui.pages.cleaner import CleanerPage
 from app.ui.pages.dashboard import DashboardPage
 from app.ui.pages.drivers import DriversPage
+from app.ui.pages.hardware import HardwarePage
 from app.ui.pages.software import SoftwarePage
 from app.ui.pages.startup import StartupPage
 from app.ui.pages.tools import ToolsPage
 from app.ui.pages.uninstall import UninstallPage
 from app.ui.tasks import UiDispatcher
-from app.ui.widgets import show_error
+from app.ui.widgets import ResultDialog, Toast, show_error
+from app.utils import notify as winnotify
 from app.utils.paths import resource_path
 from app.utils.settings import Settings
 from app.utils.system import is_admin, relaunch_as_admin
@@ -31,6 +34,8 @@ log = logging.getLogger(__name__)
 # (id, libellé, glyphe Segoe Fluent/MDL2, classe de page)
 NAVIGATION: list[tuple[str, str, str, type[Page]]] = [
     ("dashboard", "Tableau de bord", "", DashboardPage),
+    ("assistant", "Entretien guidé", "", AssistantPage),
+    ("hardware", "Mon PC", "", HardwarePage),
     ("cleaner", "Nettoyage", "", CleanerPage),
     ("drivers", "Pilotes", "", DriversPage),
     ("software", "Logiciels", "", SoftwarePage),
@@ -47,7 +52,7 @@ class NavItem(ctk.CTkFrame):
     """Entrée de la barre latérale : icône (police Windows) + libellé, survol et état actif."""
 
     def __init__(self, master, glyph: str, label: str, icon_family: str, command):
-        super().__init__(master, height=42, corner_radius=8, fg_color="transparent")
+        super().__init__(master, height=38, corner_radius=8, fg_color="transparent")
         self.pack_propagate(False)
         self._command = command
         self._active = False
@@ -84,8 +89,8 @@ class MainWindow(ctk.CTk):
         super().__init__(fg_color=theme.WINDOW_BG)
 
         self.title(f"{APP_NAME} {APP_VERSION}")
-        self.geometry("1180x740")
-        self.minsize(980, 620)
+        self.geometry("1200x780")
+        self.minsize(1000, 680)
         icon = resource_path("assets/icon.ico")
         if icon.exists():
             try:
@@ -118,8 +123,12 @@ class MainWindow(ctk.CTk):
 
         self.pages: dict[str, Page] = {}
         self.current: str | None = None
+        self.toasts: list[Toast] = []
+        self.notifier: winnotify.WindowsNotifier | None = None
         self.show_page("dashboard")
         self.protocol("WM_DELETE_WINDOW", self.on_close)
+        if not self.settings.get("welcome_done", False):
+            self.after(700, self._show_welcome)
 
     # ------------------------------------------------------------------ construction
     def _icon_font_family(self) -> str:
@@ -136,7 +145,7 @@ class MainWindow(ctk.CTk):
         bar.grid_columnconfigure(0, weight=1)
 
         brand = ctk.CTkFrame(bar, fg_color="transparent")
-        brand.grid(row=0, column=0, sticky="ew", padx=20, pady=(24, 22))
+        brand.grid(row=0, column=0, sticky="ew", padx=20, pady=(20, 16))
         ctk.CTkLabel(brand, text="NPone29", font=theme.font(22, "bold"), anchor="w").pack(anchor="w")
         ctk.CTkLabel(brand, text="Cleaner", font=theme.font(15), text_color=theme.ACCENT,
                      anchor="w").pack(anchor="w", pady=(0, 0))
@@ -145,7 +154,7 @@ class MainWindow(ctk.CTk):
         for row, (page_id, label, glyph, _cls) in enumerate(NAVIGATION, start=1):
             item = NavItem(bar, glyph if self.icon_family else "", label, self.icon_family,
                            command=lambda p=page_id: self.show_page(p))
-            item.grid(row=row, column=0, sticky="ew", padx=12, pady=2)
+            item.grid(row=row, column=0, sticky="ew", padx=12, pady=1)
             self.nav_buttons[page_id] = item
 
         bar.grid_rowconfigure(len(NAVIGATION) + 1, weight=1)
@@ -179,17 +188,22 @@ class MainWindow(ctk.CTk):
                       font=theme.font(12, "bold"), command=self.restart_as_admin).pack(side="right", padx=12, pady=8)
 
     # ------------------------------------------------------------------ navigation
+    def get_page(self, page_id: str) -> Page:
+        """Renvoie la page (en la créant au besoin) sans l'afficher."""
+        page = self.pages.get(page_id)
+        if page is None:
+            cls = next(c for pid, _l, _g, c in NAVIGATION if pid == page_id)
+            page = cls(self.page_host, self)
+            self.pages[page_id] = page
+        return page
+
     def show_page(self, page_id: str) -> Page:
         if self.current == page_id:
             return self.pages[page_id]
         if self.current and self.current in self.pages:
             self.pages[self.current].on_hide()
             self.pages[self.current].grid_remove()
-        page = self.pages.get(page_id)
-        if page is None:
-            cls = next(c for pid, _l, _g, c in NAVIGATION if pid == page_id)
-            page = cls(self.page_host, self)
-            self.pages[page_id] = page
+        page = self.get_page(page_id)
         page.grid(row=0, column=0, sticky="nsew")
         self.current = page_id
         for pid, item in self.nav_buttons.items():
@@ -201,8 +215,70 @@ class MainWindow(ctk.CTk):
         mode = APPEARANCES.get(label, "dark")
         ctk.set_appearance_mode(mode)
         self.settings.set("appearance", mode)
-        # Laisse CustomTkinter appliquer le mode avant de recolorer les tableaux ttk.
-        self.after(50, lambda: theme.apply_treeview_style(self))
+        # Laisse CustomTkinter appliquer le mode avant de recolorer les tableaux ttk et les dessins.
+        self.after(50, self._after_theme_change)
+
+    def _after_theme_change(self) -> None:
+        theme.apply_treeview_style(self)
+        for page in self.pages.values():
+            callback = getattr(page, "on_theme_change", None)
+            if callback:
+                callback()
+
+    # ------------------------------------------------------------------ notifications
+    def _hwnd(self) -> int:
+        try:
+            return int(self.wm_frame(), 16)
+        except (ValueError, TypeError):
+            return 0
+
+    def notify(self, title: str, message: str, level: str = "success",
+               action: tuple[str, object] | None = None) -> None:
+        """Prévient l'utilisateur qu'une tâche est terminée.
+
+        Toujours : une bannière dans l'application + un son.
+        Si la fenêtre n'est pas au premier plan : notification Windows + clignotement de la barre des tâches.
+        """
+        log.info("Notification : %s — %s", title, message)
+        toast = Toast(self.content, title, message, level, action=action, on_close=self._toast_closed)
+        self.toasts.append(toast)
+        self._layout_toasts()
+        winnotify.play_sound(level)
+        hwnd = self._hwnd()
+        if hwnd and not winnotify.is_foreground(hwnd):
+            if self.notifier is None:
+                self.notifier = winnotify.WindowsNotifier(hwnd, resource_path("assets/icon.ico"), APP_NAME)
+            self.notifier.show(title, message, level)
+            winnotify.flash_taskbar(hwnd)
+
+    def _toast_closed(self, toast: Toast) -> None:
+        if toast in self.toasts:
+            self.toasts.remove(toast)
+        self.after(10, self._layout_toasts)
+
+    def _layout_toasts(self) -> None:
+        y = 16
+        for toast in self.toasts[-3:]:
+            try:
+                toast.place(relx=1.0, x=-24, y=y, anchor="ne")
+                toast.lift()
+                toast.update_idletasks()
+                y += toast.winfo_reqheight() / ctk.ScalingTracker.get_widget_scaling(toast) + 10
+            except Exception:
+                continue
+
+    def _show_welcome(self) -> None:
+        self.settings.set("welcome_done", True)
+        ResultDialog(
+            self, "Bienvenue", "Bienvenue dans NPone29 Cleaner !",
+            stats=[("1. Entretien guidé", "tout vérifier en quelques clics"),
+                   ("2. Mon PC", "comprendre votre matériel"),
+                   ("3. Pilotes et logiciels", "à jour, depuis les sources officielles")],
+            tips=["Rien n'est jamais supprimé ni installé sans votre accord.",
+                  "Chaque page explique ce qu'elle fait : laissez-vous guider par les étapes en haut."],
+            actions=[("▶  Lancer l'entretien guidé (recommandé)", lambda: self.show_page("assistant").start()),
+                     ("Découvrir la carte de mon PC", lambda: self.show_page("hardware"))],
+            level="info", close_text="Explorer par moi-même", actions_title="Par où commencer ?")
 
     # ------------------------------------------------------------------ divers
     def restart_as_admin(self) -> None:
@@ -225,5 +301,7 @@ class MainWindow(ctk.CTk):
             except Exception:
                 pass
         self.driver_service.shutdown()
+        if self.notifier:
+            self.notifier.remove()
         self.settings.save()
         self.destroy()

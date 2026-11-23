@@ -6,12 +6,24 @@ import threading
 
 import customtkinter as ctk
 
-from app.core.cleaner import CATEGORY_ORDER, CleanResult, CleanTarget, ScanResult, build_targets, clean_target, scan_target
+import psutil
+
+from app.core.cleaner import (CATEGORY_ORDER, CleanResult, CleanTarget, ScanResult, build_targets, clean_target,
+                              running_blockers, scan_target)
 from app.ui import theme
 from app.ui.pages.base import Page
-from app.ui.widgets import (PageHeader, StatusLine, ask_yes_no, neutral_button, primary_button,
-                            success_button)
+from app.ui.widgets import (PageHeader, ResultDialog, StatusLine, Stepper, ask_yes_no, neutral_button,
+                            primary_button, success_button)
 from app.utils.fmt import human_size
+
+STEPS = ["Choisir", "Analyser", "Nettoyer", "Terminé"]
+
+
+def _free_space() -> int | None:
+    try:
+        return psutil.disk_usage("C:\\").free
+    except OSError:
+        return None
 
 
 class CleanerPage(Page):
@@ -25,17 +37,21 @@ class CleanerPage(Page):
         self.results: dict[str, ScanResult] = {}
         self.cancel = threading.Event()
         self.busy = False
+        self._free_before: int | None = None
 
         self.grid_columnconfigure(0, weight=1)
-        self.grid_rowconfigure(2, weight=1)
+        self.grid_rowconfigure(3, weight=1)
 
         PageHeader(self, "Nettoyage",
                    "Libérez de l'espace en supprimant les fichiers temporaires et les caches. "
                    "Vos documents, mots de passe et historiques ne sont jamais touchés.") \
-            .grid(row=0, column=0, sticky="ew", pady=(0, 14))
+            .grid(row=0, column=0, sticky="ew", pady=(0, 10))
+
+        self.stepper = Stepper(self, STEPS)
+        self.stepper.grid(row=1, column=0, sticky="w", pady=(0, 12))
 
         bar = ctk.CTkFrame(self, fg_color="transparent")
-        bar.grid(row=1, column=0, sticky="ew", pady=(0, 10))
+        bar.grid(row=2, column=0, sticky="ew", pady=(0, 10))
         self.scan_btn = primary_button(bar, "Analyser", self.start_scan, width=130)
         self.scan_btn.pack(side="left")
         self.clean_btn = success_button(bar, "Nettoyer", self.start_clean, width=130)
@@ -49,13 +65,14 @@ class CleanerPage(Page):
 
         self.list_frame = ctk.CTkScrollableFrame(self, fg_color=theme.CARD, corner_radius=12,
                                                  border_width=1, border_color=theme.CARD_BORDER)
-        self.list_frame.grid(row=2, column=0, sticky="nsew")
+        self.list_frame.grid(row=3, column=0, sticky="nsew")
         self.list_frame.grid_columnconfigure(0, weight=1)
         self._build_list()
 
         self.status = StatusLine(self)
-        self.status.grid(row=3, column=0, sticky="ew", pady=(10, 0))
-        self.status.set_text("Cochez les éléments à nettoyer puis cliquez sur « Analyser ».")
+        self.status.grid(row=4, column=0, sticky="ew", pady=(10, 0))
+        self.status.set_text("Étape 1 : cochez les éléments à nettoyer (la sélection par défaut convient dans la "
+                             "plupart des cas), puis cliquez sur « Analyser ».")
 
     # ------------------------------------------------------------------ liste
     def _build_list(self) -> None:
@@ -135,6 +152,7 @@ class CleanerPage(Page):
             return
         self.cancel.clear()
         self._set_busy(True)
+        self.stepper.set(1)
         for t in targets:
             self.size_labels[t.id].configure(text="…", text_color=theme.MUTED)
         progress = self.dispatcher.wrap(self._on_scan_progress)
@@ -164,8 +182,15 @@ class CleanerPage(Page):
 
     def _scan_done(self) -> None:
         total = sum(r.size for tid, r in self.results.items() if self.vars[tid].get())
-        self.status.idle(f"Analyse terminée : {human_size(total)} peuvent être libérés."
-                         if not self.cancel.is_set() else "Analyse annulée.")
+        if self.cancel.is_set():
+            self.stepper.set(0)
+            self.status.idle("Analyse annulée.")
+            return
+        self.stepper.set(2)
+        self.status.idle(f"Étape 3 : {human_size(total)} peuvent être libérés. Vérifiez la liste, décochez ce que "
+                         "vous voulez garder, puis cliquez sur « Nettoyer ».")
+        self.app.notify("Analyse terminée", f"{human_size(total)} de fichiers inutiles trouvés.", "info",
+                        action=("Nettoyer maintenant", self.start_clean) if total else None)
 
     # ------------------------------------------------------------------ nettoyage
     def start_clean(self) -> None:
@@ -183,9 +208,19 @@ class CleanerPage(Page):
         message += "Les fichiers en cours d'utilisation seront ignorés. Continuer ?"
         if not ask_yes_no(self, "Confirmer le nettoyage", message):
             return
+        blockers = running_blockers([t.id for t in targets])
+        if blockers and not ask_yes_no(
+                self, "Applications ouvertes",
+                "Ces applications sont ouvertes : " + ", ".join(blockers) + ".\n\n"
+                "Leurs fichiers en cours d'utilisation ne pourront pas être supprimés. Pour un nettoyage complet, "
+                "fermez-les puis relancez.\n\nContinuer quand même ?"):
+            self.status.set_text("Fermez les applications indiquées puis cliquez à nouveau sur « Nettoyer ».")
+            return
 
+        self._free_before = _free_space()
         self.cancel.clear()
         self._set_busy(True)
+        self.stepper.set(2)
         progress = self.dispatcher.wrap(self._on_clean_progress)
 
         def work() -> list[CleanResult]:
@@ -222,6 +257,26 @@ class CleanerPage(Page):
         if skipped:
             msg += f" {skipped} fichiers en cours d'utilisation ont été ignorés."
         self.status.idle(msg)
+        self.stepper.set(len(STEPS))
+        self.app.notify("Nettoyage terminé", f"{human_size(freed)} libérés sur votre PC.", "success")
+
+        stats = [("Espace libéré", human_size(freed)), ("Fichiers supprimés", f"{deleted:,}".replace(",", " "))]
+        if skipped:
+            stats.append(("Fichiers ignorés (en cours d'utilisation)", f"{skipped:,}".replace(",", " ")))
+        after = _free_space()
+        if self._free_before is not None and after is not None:
+            stats.append(("Espace libre sur C:", f"{human_size(self._free_before)} → {human_size(after)}"))
+        tips = []
+        if skipped:
+            tips.append("Les fichiers ignorés sont utilisés par des programmes ouverts : ils seront supprimés "
+                        "lors d'un prochain nettoyage, une fois ces programmes fermés.")
+        tips.append("Les caches se reconstituent avec le temps : un nettoyage par mois suffit largement.")
+        ResultDialog(self, "Nettoyage terminé", f"{human_size(freed)} libérés !", stats, tips, actions=[
+            ("Vérifier les pilotes", lambda: self.app.show_page("drivers").start_analysis()),
+            ("Mettre à jour les logiciels", lambda: self.app.show_page("software").start_search()),
+            ("Découvrir la carte de mon PC", lambda: self.app.show_page("hardware")),
+        ])
 
     def _on_error(self, exc: BaseException) -> None:
         self.status.idle(f"Erreur : {exc}")
+        self.app.notify("Erreur pendant le nettoyage", str(exc), "error")
