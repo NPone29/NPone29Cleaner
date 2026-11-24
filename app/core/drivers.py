@@ -245,10 +245,12 @@ def _query_problem_devices() -> list[ProblemDevice]:
 
 def _query_hardware_vendors() -> dict[str, str]:
     wmi = _wmi()
-    result = {"system": "", "model": "", "gpus": "", "board_maker": "", "board_product": ""}
-    for row in wmi.ExecQuery("SELECT Manufacturer, Model FROM Win32_ComputerSystem"):
+    # Uniquement marque, modèle et identifiant de modèle (SKU) : jamais de numéro de série / service tag.
+    result = {"system": "", "model": "", "sku": "", "gpus": "", "board_maker": "", "board_product": ""}
+    for row in wmi.ExecQuery("SELECT Manufacturer, Model, SystemSKUNumber FROM Win32_ComputerSystem"):
         result["system"] = _str(row.Manufacturer)
         result["model"] = _str(row.Model)
+        result["sku"] = _str(row.SystemSKUNumber)
     for row in wmi.ExecQuery("SELECT Manufacturer, Product FROM Win32_BaseBoard"):
         result["board_maker"] = _str(row.Manufacturer)
         result["board_product"] = _str(row.Product)

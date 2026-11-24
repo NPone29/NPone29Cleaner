@@ -33,6 +33,9 @@ USER_AGENT = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) NPone29Cleaner"
 # Nature d'un lien, du plus précis au moins précis.
 EXACT, DOWNLOAD, PREFILLED, GENERAL, SEARCH = "exact", "download", "prefilled", "general", "search"
 LINK_ORDER = [DOWNLOAD, EXACT, PREFILLED, GENERAL, SEARCH]
+# Une recherche « limitée au site officiel » (kind SEARCH) passe par ce moteur ; elle ne fait qu'ouvrir
+# une page de résultats dans le navigateur, rien n'est téléchargé.
+SEARCH_HOSTS = ("www.google.com",)
 
 
 @dataclass(frozen=True)
@@ -93,6 +96,7 @@ class VendorCheck:
     page_url: str = ""             # page officielle du pilote (notes de version, détails)
     download_url: str = ""         # fichier officiel à télécharger
     extra: object = None           # données propres à la source (ex. pilote NVIDIA installable)
+    comparable: bool = True        # False si les versions n'ont pas pu être comparées
 
 
 @dataclass
@@ -100,7 +104,7 @@ class SourceRun:
     """Résultat de toutes les vérifications d'une analyse."""
     checks: dict[str, list[VendorCheck]] = field(default_factory=dict)
     notes: list[str] = field(default_factory=list)
-    verified_by: list[str] = field(default_factory=list)   # sources effectivement consultées
+    verified_by: list[str] = field(default_factory=list)   # noms (DriverSource.name) des sources consultées
 
     def add(self, key: str, check: VendorCheck) -> None:
         self.checks.setdefault(key, []).append(check)
@@ -135,7 +139,14 @@ class DriverSource:
         return []
 
     def safe(self, link: DownloadLink) -> bool:
+        if link.kind == SEARCH and is_allowed_url(link.url, SEARCH_HOSTS):
+            return True
         return bool(self.allowed_hosts) and is_allowed_url(link.url, self.allowed_hosts)
+
+    # -- explication quand le pilote n'a pas pu être vérifié
+    def note_for(self, ctx: SystemContext, dev: DeviceRef, consulted: list[str]) -> str:
+        """Phrase expliquant pourquoi cette source n'a pas vérifié le pilote (vide si rien à dire)."""
+        return "" if self.has_public_api else self.no_api_note
 
 
 # --------------------------------------------------------------------------- versions
@@ -177,6 +188,12 @@ def pnp_matches(pattern: str, dev: DeviceRef) -> bool:
     if not p:
         return False
     return dev.device_id.upper().startswith(p) or dev.hardware_id.upper().startswith(p)
+
+
+def same_chip(pattern: str, dev: DeviceRef) -> bool:
+    """Même bus, même fabricant et même puce (VEN/DEV), sans tenir compte du SUBSYS."""
+    bus, ven, chip = parse_ids(pattern)
+    return bool(ven and chip) and (bus, ven, chip) == dev.ids
 
 
 def subsys(device_id: str) -> str:
@@ -253,6 +270,28 @@ def read_xml_text(data: bytes) -> str:
         end = text.find("?>")
         text = text[end + 2:]
     return text
+
+
+def local_name(tag: str) -> str:
+    """'{espace de noms}Nom' -> 'Nom' (les catalogues n'utilisent pas tous un espace de noms)."""
+    return tag.rsplit("}", 1)[-1]
+
+
+def find_all(elem, name: str) -> list:
+    """Descendants (à toute profondeur) portant ce nom, espace de noms ignoré."""
+    return [e for e in elem.iter() if local_name(e.tag) == name and e is not elem]
+
+
+def find_text(elem, name: str) -> str:
+    for e in find_all(elem, name):
+        if e.text and e.text.strip():
+            return e.text.strip()
+    return ""
+
+
+def file_time(path: Path) -> datetime:
+    """Date à laquelle un catalogue a été téléchargé (= date de la vérification)."""
+    return datetime.fromtimestamp(path.stat().st_mtime)
 
 
 def current_windows() -> tuple[int, str]:

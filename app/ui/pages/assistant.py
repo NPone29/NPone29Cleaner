@@ -77,7 +77,7 @@ class AssistantPage(Page):
     STEPS = [
         ("Rechercher les fichiers inutiles", "Fichiers temporaires, caches, corbeille… (analyse seulement)."),
         ("Nettoyer", "Supprime ce qui a été trouvé, après votre accord."),
-        ("Vérifier les pilotes", "Compare vos pilotes avec Windows Update et les sites des fabricants."),
+        ("Vérifier les pilotes", "Compare vos pilotes avec Windows Update et les sources officielles des fabricants."),
         ("Vérifier les logiciels", "Cherche les nouvelles versions de vos applications."),
         ("Vérifier le démarrage", "Compte les programmes lancés avec Windows (ils ralentissent l'allumage)."),
     ]
@@ -238,19 +238,30 @@ class AssistantPage(Page):
             page.show_analysis(report, notify=False)
             auto = sum(1 for d in report.devices if d.can_auto_install)
             attention = sum(1 for d in report.devices
-                            if d.status in (driver_analysis.PROBLEM, driver_analysis.GENERIC, driver_analysis.OLD))
+                            if d.status in (driver_analysis.PROBLEM, driver_analysis.GENERIC)
+                            or (d.status == driver_analysis.VENDOR_UPDATE and not d.can_auto_install))
+            unverified = report.count(driver_analysis.OLD, driver_analysis.UNVERIFIED)
+            verified = report.count(driver_analysis.VERIFIED)
             self.results["drivers_auto"] = auto
             self.results["drivers_check"] = attention
+            self.results["drivers_unverified"] = unverified
             if auto or attention:
                 parts = []
                 if auto:
                     parts.append(f"{auto} pilote(s) à mettre à jour")
                 if attention:
-                    parts.append(f"{attention} à vérifier")
-                card.set_state("done", " • ".join(parts) + ". Vous pourrez les installer à la fin.", actions=[
+                    parts.append(f"{attention} à corriger ou télécharger")
+                if unverified:
+                    parts.append(f"{unverified} non vérifiable(s)")
+                card.set_state("done", " • ".join(parts) + ". Vous pourrez vous en occuper à la fin.", actions=[
+                    ("Voir les pilotes", lambda: self.app.show_page("drivers"), "neutral")])
+            elif unverified:
+                card.set_state("done", f"{verified} pilote(s) vérifié(s) à jour. {unverified} ne peuvent pas être "
+                                       "vérifiés automatiquement (pas de service public chez leur fabricant) : "
+                                       "la page Pilotes donne le lien officiel de chacun.", actions=[
                     ("Voir les pilotes", lambda: self.app.show_page("drivers"), "neutral")])
             else:
-                card.set_state("done", "Tous vos pilotes sont à jour.")
+                card.set_state("done", "Tous vos pilotes sont vérifiés et à jour.")
             if not self._stopped():
                 self._step_software()
 
@@ -320,7 +331,8 @@ class AssistantPage(Page):
         r = self.results
         stats = [("Espace libéré", human_size(r.get("freed", 0))),
                  ("Pilotes à mettre à jour", str(r.get("drivers_auto", "—"))),
-                 ("Pilotes à vérifier", str(r.get("drivers_check", "—"))),
+                 ("Pilotes à corriger", str(r.get("drivers_check", "—"))),
+                 ("Pilotes non vérifiables", str(r.get("drivers_unverified", "—"))),
                  ("Logiciels à mettre à jour", str(r.get("software", "—"))),
                  ("Programmes au démarrage", str(r.get("startup", "—")))]
         actions = []

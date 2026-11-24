@@ -7,7 +7,7 @@ from datetime import datetime
 
 from app.core import nvidia
 from app.core.driver_sources.base import (DOWNLOAD, EXACT, GENERAL, DeviceRef, DownloadLink, DriverSource,
-                                          SourceRun, SystemContext, VendorCheck)
+                                          SourceRun, SystemContext, VendorCheck, version_parts)
 
 log = logging.getLogger(__name__)
 
@@ -38,17 +38,24 @@ class NvidiaSource(DriverSource):
                 continue
             run.add(dev.key, self.make_check(dev.version, latest))
         if done:
-            run.verified_by.append("nvidia.com")
+            run.verified_by.append(self.name)
 
     @staticmethod
     def make_check(windows_version: str, latest: nvidia.NvidiaDriver, now: datetime | None = None) -> VendorCheck:
         installed = nvidia.windows_to_nvidia_version(windows_version)
+        comparable = version_parts(latest.version) is not None and version_parts(installed) is not None
         return VendorCheck(
             source="nvidia.com", latest_version=latest.version,
-            update_available=nvidia.is_newer(latest.version, installed),
+            update_available=comparable and nvidia.is_newer(latest.version, installed),
             checked_at=now or datetime.now(), title=latest.name, release_date=latest.release_date,
-            page_url=latest.details_url, download_url=latest.download_url, extra=latest,
+            page_url=latest.details_url, download_url=latest.download_url, extra=latest, comparable=comparable,
         )
+
+    def note_for(self, ctx: SystemContext, dev: DeviceRef, consulted: list[str]) -> str:
+        if self.name in consulted and self.applies_to_device(dev):
+            return ("Cette carte n'a pas été trouvée dans la liste officielle des produits NVIDIA : "
+                    "choisissez-la à la main sur la page des pilotes NVIDIA.")
+        return ""
 
     def links(self, ctx: SystemContext, dev: DeviceRef, checks: list[VendorCheck]) -> list[DownloadLink]:
         if not self.applies_to_device(dev):

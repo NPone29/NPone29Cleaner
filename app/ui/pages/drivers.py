@@ -24,8 +24,9 @@ STEPS = ["Analyser", "Vérifier", "Mettre à jour", "Terminé"]
 STATUS_TAGS = {
     driver_analysis.PROBLEM: ("error",), driver_analysis.UPDATE: ("warn",),
     driver_analysis.VENDOR_UPDATE: ("warn",), driver_analysis.GENERIC: ("warn",),
-    driver_analysis.OLD: ("muted",), driver_analysis.OK: ("ok",),
+    driver_analysis.OLD: ("muted",), driver_analysis.UNVERIFIED: ("muted",), driver_analysis.VERIFIED: ("ok",),
 }
+UNVERIFIABLE = (driver_analysis.OLD, driver_analysis.UNVERIFIED)
 
 
 class DriversPage(Page):
@@ -111,17 +112,20 @@ class DriversPage(Page):
         self.summary_label = ctk.CTkLabel(bar, text="", font=theme.font(13, "bold"))
         self.summary_label.pack(side="right")
 
-        TipBox(frame, "L'analyse compare chaque pilote avec Windows Update et, pour les cartes NVIDIA, avec nvidia.com. "
-                      "Cliquez sur une ligne pour savoir quoi faire : installation automatique quand c'est possible, "
-                      "sinon lien direct vers la page officielle du fabricant.") \
+        TipBox(frame, "Chaque pilote est comparé à Windows Update et aux sources officielles : nvidia.com pour les "
+                      "cartes NVIDIA, et le catalogue du fabricant pour les PC Dell, HP et Lenovo. Un pilote n'est "
+                      "marqué « À jour (vérifié) » que si l'une de ces sources l'a confirmé. Les autres fabricants "
+                      "(Intel, AMD, Realtek, ASUS, MSI…) ne proposent pas de service public de vérification : ces "
+                      "pilotes sont « Non vérifiables » et le bouton « Télécharger » ouvre leur page officielle.") \
             .grid(row=2, column=0, sticky="ew", pady=(0, 8))
 
         self.analysis_table = Table(frame, [
-            ("name", "Périphérique", 300, "w", True),
-            ("cat", "Catégorie", 140, "w", False),
-            ("vendor", "Fabricant", 120, "w", False),
-            ("version", "Version installée", 140, "w", False),
-            ("status", "État", 150, "w", False),
+            ("name", "Périphérique", 270, "w", True),
+            ("cat", "Catégorie", 125, "w", False),
+            ("vendor", "Fabricant", 105, "w", False),
+            ("version", "Version installée", 125, "w", False),
+            ("status", "État", 175, "w", False),
+            ("source", "Vérifié par", 170, "w", False),
         ], selectmode="browse", on_select=self._render_detail, height=7)
         self.analysis_table.grid(row=3, column=0, sticky="nsew")
 
@@ -167,27 +171,38 @@ class DriversPage(Page):
         self.devices = {d.key: d for d in report.devices}
         rows = []
         for d in report.devices:
-            rows.append((d.key, [d.name, d.category, d.vendor.name, d.version, d.status_label],
-                         [d.name, d.category, d.vendor.name, d.version, driver_analysis.STATUS_ORDER.index(d.status)],
+            source = d.checked_source or "—"
+            rows.append((d.key, [d.name, d.category, d.vendor.name, d.version, d.status_label, source],
+                         [d.name, d.category, d.vendor.name, d.version, driver_analysis.STATUS_ORDER.index(d.status),
+                          source],
                          STATUS_TAGS.get(d.status, ())))
         self.analysis_table.set_rows(rows)
         if report.devices:
             first = report.devices[0].key
             self.analysis_table.tree.selection_set([first])
             self.analysis_table.tree.see(first)
-        self.wu_auto = sum(1 for d in report.devices if d.wu_update_ids)
         auto = sum(1 for d in report.devices if d.can_auto_install)
-        attention = sum(1 for d in report.devices if d.status in (driver_analysis.PROBLEM, driver_analysis.GENERIC))
-        to_check = report.count(driver_analysis.OLD)
+        manual = sum(1 for d in report.devices
+                     if d.status == driver_analysis.VENDOR_UPDATE and not d.can_auto_install)
+        attention = report.count(driver_analysis.PROBLEM, driver_analysis.GENERIC)
+        unverified = report.count(*UNVERIFIABLE)
+        verified = report.count(driver_analysis.VERIFIED)
         parts = []
         if auto:
             parts.append(f"{auto} à mettre à jour")
+        if manual:
+            parts.append(f"{manual} à télécharger")
         if attention:
             parts.append(f"{attention} à corriger")
-        if to_check:
-            parts.append(f"{to_check} à vérifier")
-        summary = " • ".join(parts) if parts else "✓ Tout est à jour"
-        self.summary_label.configure(text=summary, text_color=theme.WARNING if parts else theme.SUCCESS)
+        info = [f"{unverified} non vérifiable(s)"] if unverified else []
+        if parts or info:
+            summary = " • ".join(parts + info)
+        elif verified:
+            summary = "✓ Tout est vérifié et à jour"
+        else:
+            summary = "Aucun pilote à analyser"
+        color = theme.WARNING if parts else theme.MUTED if info else theme.SUCCESS
+        self.summary_label.configure(text=summary, text_color=color)
         self.stepper.set(1 if parts else len(STEPS))
         note = (" " + " ".join(report.notes)) if report.notes else ""
         if auto:
@@ -195,12 +210,16 @@ class DriversPage(Page):
                              f"« Tout mettre à jour automatiquement » ou choisissez ligne par ligne.{note}")
         elif parts:
             self.status.idle(f"Étape 2 : sélectionnez les lignes signalées pour voir quoi faire.{note}")
+        elif unverified:
+            self.status.idle(f"Analyse terminée : {verified} pilote(s) vérifié(s) à jour, {unverified} non "
+                             "vérifiable(s) automatiquement : sélectionnez-les pour ouvrir leur page officielle."
+                             f"{note}")
         else:
-            self.status.idle(f"Analyse terminée : aucun pilote à mettre à jour.{note}")
+            self.status.idle(f"Analyse terminée : tous les pilotes analysés sont vérifiés et à jour.{note}")
         if notify:
-            self.app.notify("Analyse des pilotes terminée", summary + ".",
-                            "warning" if parts else "success",
-                            action=("Voir", lambda: self.app.show_page("drivers")) if parts else None)
+            level = "warning" if parts else "info" if info else "success"
+            self.app.notify("Analyse des pilotes terminée", summary + ".", level,
+                            action=("Voir", lambda: self.app.show_page("drivers")) if parts or info else None)
 
     def _selected_device(self) -> DeviceStatus | None:
         ids = self.analysis_table.selected()
@@ -217,9 +236,22 @@ class DriversPage(Page):
         self.detail_title.configure(text=f"{device.status_label}   {device.name}",
                                     text_color=theme.TAG_COLORS.get(STATUS_TAGS.get(device.status, ("",))[0],
                                                                     theme.NEUTRAL_TEXT))
-        info = f"Fournisseur du pilote : {device.provider or '—'}   •   Version : {device.version}   •   " \
-               f"Date : {format_date(device.date)}"
-        self.detail_text.configure(text=f"{device.explanation}\n{info}")
+        lines = [device.explanation,
+                 f"Fournisseur du pilote : {device.provider or '—'}   •   Version installée : {device.version}   •   "
+                 f"Date : {format_date(device.date)}"]
+        if device.checked_source:
+            when = device.checked_at.strftime("%d/%m/%Y à %H:%M") if device.checked_at else "—"
+            line = f"Vérifié par : {device.checked_source}   •   le {when}"
+            if device.latest_version and not device.wu_update_ids:
+                line += f"   •   Dernière version publiée : {device.latest_version}"
+            lines.append(line)
+        elif device.status in UNVERIFIABLE:
+            lines.append("Non vérifié : " + (device.no_api_note or
+                                             "aucune source officielle ne permet de vérifier ce périphérique."))
+        best = device.best_link
+        if best:
+            lines.append(f"« Télécharger » ouvre : {best.label}")
+        self.detail_text.configure(text="\n".join(lines))
         state = "disabled" if self.busy else "normal"
         buttons = []
         if device.wu_update_ids:
@@ -229,8 +261,12 @@ class DriversPage(Page):
             nv = device.nvidia_driver
             buttons.append(success_button(self.detail_buttons, f"Télécharger et installer ({nv.size_text})",
                                           lambda: self.install_nvidia(nv), width=10, state=state))
-        for label, url in device.links[:4]:
-            buttons.append(neutral_button(self.detail_buttons, f"{label}  ↗", lambda u=url: open_url(u), width=10))
+        if best:
+            buttons.append(primary_button(self.detail_buttons, "Télécharger  ↗", lambda u=best.url: open_url(u),
+                                          width=10))
+        for link in device.links[1:5]:
+            buttons.append(neutral_button(self.detail_buttons, f"{link.label}  ↗", lambda u=link.url: open_url(u),
+                                          width=10))
         # Trois boutons par ligne pour ne jamais déborder.
         for i, button in enumerate(buttons):
             button.grid(row=i // 3, column=i % 3, sticky="w", padx=4, pady=3)
@@ -246,8 +282,8 @@ class DriversPage(Page):
         if not wu_ids and not nv:
             show_info(self, "Rien à installer",
                       "Aucun pilote ne peut être mis à jour automatiquement.\n\n"
-                      "Pour les lignes « à vérifier », sélectionnez-les : des liens vers les pages officielles "
-                      "vous sont proposés.")
+                      "Pour les autres lignes (mise à jour chez le fabricant, non vérifiable), sélectionnez-les : "
+                      "le bouton « Télécharger » ouvre la page officielle la plus précise.")
             return
         if wu_ids:
             self.start_install(wu_ids, on_complete=(lambda: self.install_nvidia(nv)) if nv else None)
