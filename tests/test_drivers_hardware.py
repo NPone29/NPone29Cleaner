@@ -6,6 +6,9 @@ from datetime import datetime
 
 from app.core import driver_analysis, hardware, nvidia, vendors
 from app.core.driver_analysis import analyse
+from app.core.driver_sources import SystemContext
+from app.core.driver_sources.base import DOWNLOAD, EXACT, PREFILLED
+from app.core.driver_sources.nvidia_source import NvidiaSource
 from app.core.drivers import DriverUpdate, InstalledDriver, ProblemDevice
 from app.utils.download import is_allowed_url
 
@@ -28,7 +31,7 @@ BT_ENUM = drv("Microsoft Bluetooth Enumerator", "Bluetooth", "Microsoft", r"BTH\
 CHIPSET = [drv(f"Intel PCI Express Root Port #{i}", "System", "INTEL", fr"PCI\VEN_8086&DEV_7A3{i}\3&{i}",
                version="10.1.46.3") for i in range(5)]
 BASIC = drv("Microsoft Basic Display Adapter", "Display", "Microsoft", r"PCI\VEN_1002&DEV_73BF\4&2")
-BOARD = {"board_maker": "ASUSTeK COMPUTER INC.", "board_product": "PRIME Z790-P WIFI"}
+BOARD = SystemContext(board_maker="ASUSTeK COMPUTER INC.", board_product="PRIME Z790-P WIFI")
 
 
 def by_name(report, name):
@@ -103,10 +106,11 @@ def test_download_url_allowlist():
 def test_windows_update_match_marks_update():
     update = DriverUpdate("u1", "Intel net Driver Update", "Intel", "AX201", "Networking", None, 10, False,
                           hardware_id=r"PCI\VEN_8086&DEV_7A70&SUBSYS_00748086")
-    report = analyse([WIFI], [update], [], board_info=BOARD, now=NOW)
+    report = analyse([WIFI], [update], [], ctx=BOARD, now=NOW)
     wifi = by_name(report, "Intel(R) Wi-Fi")
     assert wifi.status == driver_analysis.UPDATE
     assert wifi.wu_update_ids == ["u1"] and wifi.can_auto_install
+    assert wifi.checked_source == "Windows Update"
 
 
 def test_unmatched_update_still_listed():
@@ -116,25 +120,38 @@ def test_unmatched_update_still_listed():
     assert any(d.wu_update_ids == ["u2"] and d.status == driver_analysis.UPDATE for d in report.devices)
 
 
+def nvidia_checks(latest):
+    return {GPU.device_id: [NvidiaSource.make_check(GPU.version, latest, now=NOW)]}
+
+
 def test_nvidia_vendor_update():
     latest = nvidia.NvidiaDriver("621.24", "", "https://fr.download.nvidia.com/a.exe",
                                  "https://www.nvidia.com/d/", "1 GB", "Game Ready")
-    report = analyse([GPU], [], [], nvidia_latest={GPU.device_name: latest}, now=NOW)
+    report = analyse([GPU], [], [], checks=nvidia_checks(latest), now=NOW)
     gpu = by_name(report, "NVIDIA GeForce")
     assert gpu.status == driver_analysis.VENDOR_UPDATE
-    assert gpu.version == "621.14" and gpu.nvidia_driver is latest
+    assert gpu.version == "621.14" and gpu.nvidia_driver is latest and gpu.can_auto_install
+    assert [link.kind for link in gpu.links[:2]] == [DOWNLOAD, EXACT]
     same = nvidia.NvidiaDriver("621.14", "", "", "https://www.nvidia.com/d/", "", "")
-    assert by_name(analyse([GPU], [], [], nvidia_latest={GPU.device_name: same}, now=NOW),
-                   "NVIDIA GeForce").status == driver_analysis.OK
+    gpu = by_name(analyse([GPU], [], [], checks=nvidia_checks(same), now=NOW), "NVIDIA GeForce")
+    assert gpu.status == driver_analysis.VERIFIED
+    assert gpu.checked_source == "nvidia.com" and gpu.checked_at == NOW and gpu.nvidia_driver is None
+
+
+def test_nvidia_without_check_is_not_up_to_date():
+    gpu = by_name(analyse([GPU], [], [], now=NOW), "NVIDIA GeForce")
+    assert gpu.status == driver_analysis.UNVERIFIED and not gpu.checked_source
 
 
 def test_old_driver_links_to_motherboard():
-    report = analyse([LAN], [], [], board_info=BOARD, now=NOW)
+    report = analyse([LAN], [], [], ctx=BOARD, now=NOW)
     lan = by_name(report, "Realtek")
     assert lan.status == driver_analysis.OLD
-    labels = [label for label, _ in lan.links]
-    assert labels[0] == "Pilotes de la carte mère ASUS"
-    assert "Catalogue Microsoft" in labels
+    assert lan.best_link.kind == PREFILLED
+    assert lan.best_link.url == "https://www.asus.com/fr/supportonly/PRIME%20Z790-P%20WIFI/helpdesk_download/"
+    assert any(link.label.startswith("Catalogue Microsoft") for link in lan.links)
+    assert "Realtek ne propose pas de service public" in lan.no_api_note
+    assert "ASUS ne propose pas de service public" in lan.no_api_note
 
 
 def test_generic_and_virtual_devices():
@@ -148,6 +165,7 @@ def test_chipset_components_are_grouped():
     report = analyse(CHIPSET, [], [], now=NOW)
     assert len(report.devices) == 1
     assert report.devices[0].count == 5 and "(5 composants)" in report.devices[0].name
+    assert report.devices[0].status == driver_analysis.UNVERIFIED
 
 
 def test_problems_and_disabled_devices():
