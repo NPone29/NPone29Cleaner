@@ -122,13 +122,103 @@ def test_dell_catalog_parsing():
 
 def test_dell_matching_and_newest_version():
     drivers = dell_drivers()
-    best = dell.best(dell.matching(drivers, ref(CHIPSET)))
-    assert best.release_id == "025D7"
-    check = dell.make_check(ref(CHIPSET), best, NOW)
+    candidates = dell.matching(drivers, ref(CHIPSET))
+    assert dell.best(candidates).release_id == "025D7"
+    check = dell.make_check(ref(CHIPSET), candidates, NOW)
     assert check.update_available and check.comparable and check.latest_version == "10.1.50.1"
     # Le SUBSYS précisé par Dell doit correspondre : WIFI2 (autre sous-système) est écarté.
     assert [d.release_id for d in dell.matching(drivers, ref(WIFI))] == ["WIFI1"]
     assert dell.matching(drivers, ref(AUDIO)) == []      # pas un périphérique PCI
+
+
+# Cas réel (OptiPlex 7000) : la version d'un paquet Dell n'est pas celle du pilote qu'il installe.
+def dell_pkg(release, version, dell_version, name, category="Network"):
+    return dell.DellDriver(release_id=release, name=f"{name},{version},{dell_version}", version=version,
+                           dell_version=dell_version, release_date="June 12, 2026", path=f"F/{release}.EXE",
+                           category=category, pci=[("8086", "1A1C", "", "")])
+
+
+ETHERNET = drv("Intel(R) Ethernet Connection (17) I219-LM", "Net", "Intel",
+               r"PCI\VEN_8086&DEV_1A1C&SUBSYS_0AC11028&REV_11\3&1", version="12.19.2.66")
+ETH_PACKAGES = [dell_pkg("RR43Y", "12.19.2.56", "A30", "Intel PCIe Ethernet Controller Driver"),
+                dell_pkg("PGN38", "20.0.3.28", "A07", "Intel PCIe Ethernet Controller Driver")]
+
+DUP_LOG = """[Wed Nov 25 14:33:38 2026]\tDUP Framework EXE Version: 5.7.0.136
+[Wed Nov 25 14:33:38 2026]\tDUP Release: PGN38A07
+[Wed Nov 25 14:33:40 2026]\tDUP Vendor Software Version: 20.0.3.28
+[25.11.2026 14:33:42] inf file C:\\ProgramData\\dell\\drivers\\x\\e1dn.inf is installed successfully
+[Wed Nov 25 14:33:59 2026]\tName of Exit Code: SUCCESS
+[Wed Nov 25 14:33:59 2026]\tExit Code set to: 0 (0x0)
+[Wed Nov 25 14:33:59 2026]\tResult: SUCCESS
+[Wed Nov 25 14:34:05 2026]\tName of Exit Code: SUCCESS
+[Wed Nov 25 15:00:00 2026]\tDUP Release: G896WA14
+[Wed Nov 25 15:00:09 2026]\tExit Code set to: 1 (0x1)
+"""
+
+
+def test_dup_log_parsing(tmp_path):
+    runs = dell.parse_dup_log(DUP_LOG)
+    assert [(r.key, r.exit_code) for r in runs] == [("PGN38A07", 0), ("G896WA14", 1)]
+    assert runs[0].when == datetime(2026, 11, 25, 14, 33, 59)
+    (tmp_path / "Intel-PCIe-Ethernet_PGN38.txt").write_bytes(DUP_LOG.encode("utf-16"))   # format réel : UTF-16
+    (tmp_path / "autre.txt").write_bytes(b"\xff\xfe")
+    applied = dell.applied_packages(tmp_path)
+    assert list(applied) == ["PGN38A07"]                   # l'échec (code 1) ne compte pas
+    assert dell.applied_packages(tmp_path / "absent") == {}
+
+
+def test_dell_package_already_installed_is_up_to_date():
+    """Le bug signalé : paquet installé, mais l'application réclamait toujours la même mise à jour."""
+    applied = {"PGN38A07": dell.AppliedPackage("PGN38A07", 0, datetime(2026, 11, 25))}
+    check = dell.make_check(ref(ETHERNET), ETH_PACKAGES, NOW, applied)
+    assert check.comparable and not check.update_available and check.latest_version == "20.0.3.28"
+    assert "déjà été installé" in check.note and "25/11/2026" in check.note
+    report = analyse([ETHERNET], [], [], checks={ref(ETHERNET).key: [check]}, ctx=DELL, now=NOW, consulted=["Dell"])
+    row = report.devices[0]
+    assert row.status == driver_analysis.VERIFIED
+    assert "Inutile de le réinstaller" in row.explanation
+
+
+def test_dell_package_numbering_differs_is_not_an_update():
+    # Jamais installé via un paquet Dell, et 20.0.3.28 (paquet) n'est pas comparable à 12.19.2.66 (pilote).
+    check = dell.make_check(ref(ETHERNET), ETH_PACKAGES, NOW, {})
+    assert not check.comparable and not check.update_available
+    report = analyse([ETHERNET], [], [], checks={ref(ETHERNET).key: [check]}, ctx=DELL, now=NOW, consulted=["Dell"])
+    row = report.devices[0]
+    assert row.status == driver_analysis.UNVERIFIED
+    assert "numérotation ne correspond pas" in row.no_api_note
+    assert row.best_link.url == "https://downloads.dell.com/F/PGN38.EXE"     # le paquet reste proposé
+
+
+def test_dell_older_package_installed_means_update():
+    newer = ETH_PACKAGES + [dell_pkg("NEW01", "20.0.4.1", "A08", "Intel PCIe Ethernet Controller Driver")]
+    applied = {"PGN38A07": dell.AppliedPackage("PGN38A07", 0, datetime(2026, 11, 25))}
+    check = dell.make_check(ref(ETHERNET), newer, NOW, applied)
+    assert check.update_available and check.latest_version == "20.0.4.1"
+    assert "remplacé par la version 20.0.4.1" in check.note
+    # Réédition (A08) de la même version : pas de mise à jour à réclamer.
+    reissue = ETH_PACKAGES + [dell_pkg("PGN38", "20.0.3.28", "A08", "Intel PCIe Ethernet Controller Driver")]
+    assert not dell.make_check(ref(ETHERNET), reissue, NOW, applied).update_available
+
+
+def test_dell_same_numbering_still_compared():
+    gpu = drv("Intel(R) UHD Graphics 770", "Display", "Intel", r"PCI\VEN_8086&DEV_4690&SUBSYS_0AC11028\3&1",
+              version="30.0.101.2079")
+    pkg = dell_pkg("JJ92M", "32.0.101.7085", "A00", "Intel UHD Graphics Driver", "Video")
+    check = dell.make_check(ref(gpu), [pkg], NOW, {})
+    assert check.comparable and check.update_available
+    assert compare_versions("32.0.101.7085", "30.0.101.2079") == 1
+
+
+def test_dell_unrelated_packages_ignored():
+    mei = drv("Intel(R) Management Engine Interface #1", "System", "Intel",
+              r"PCI\VEN_8086&DEV_7AE8&SUBSYS_0AC11028\3&1", version="2540.8.7.0")
+    pkgs = [dell_pkg("G896W", "2543.8.42.0", "A14", "Intel Management Engine Components Installer", "Chipset"),
+            dell_pkg("MX1PP", "5.0.41.0", "A02", "Waves MaxxAudio Pro Application", "Audio"),
+            dell_pkg("FXX89", "20.2.13.1038", "A06", "Intel Rapid Storage Technology Driver and Application",
+                     "Serial ATA"),
+            dell_pkg("DHPVC", "30.100.2531.33", "A02", "Intel Serial IO Driver", "Chipset")]
+    assert [d.release_id for d in dell.relevant(pkgs, ref(mei))] == ["G896W"]
 
 
 # --------------------------------------------------------------------------- HP
@@ -254,7 +344,7 @@ def test_unverified_by_default():
 def test_verified_via_dell():
     drivers = dell_drivers()
     up_to_date = drv("Intel Chipset", "System", "INTEL", r"PCI\VEN_8086&DEV_7A30\3&0", version="10.1.50.1")
-    check = dell.make_check(ref(up_to_date), dell.best(dell.matching(drivers, ref(up_to_date))), NOW)
+    check = dell.make_check(ref(up_to_date), dell.matching(drivers, ref(up_to_date)), NOW)
     report = analyse([up_to_date], [], [], checks={ref(up_to_date).key: [check]}, ctx=DELL, now=NOW,
                      consulted=["Dell"])
     row = report.devices[0]

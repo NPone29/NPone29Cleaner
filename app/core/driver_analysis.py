@@ -163,7 +163,15 @@ def to_ref(d: InstalledDriver) -> DeviceRef:
 
 
 def _explain(status: str, vendor: Vendor, provider: str, version: str, latest: str, date: datetime | None,
-             source: str = "", problem: str = "", basic_display: bool = False, nvidia_auto: bool = False) -> str:
+             source: str = "", problem: str = "", basic_display: bool = False, nvidia_auto: bool = False,
+             note: str = "") -> str:
+    text = _explain_status(status, vendor, provider, version, latest, date, source, problem, basic_display,
+                           nvidia_auto)
+    return f"{text} {note}" if note and status in (VENDOR_UPDATE, VERIFIED) else text
+
+
+def _explain_status(status: str, vendor: Vendor, provider: str, version: str, latest: str, date: datetime | None,
+                    source: str, problem: str, basic_display: bool, nvidia_auto: bool) -> str:
     if status == PROBLEM:
         return (f"Windows signale un problème : « {problem} ». Installer ou réinstaller le bon pilote "
                 "règle souvent le souci.")
@@ -273,7 +281,16 @@ def analyse(
 
         note = ""
         if status in (OLD, UNVERIFIED):
-            note = " ".join(driver_sources.no_api_notes(ctx, ref, consulted))
+            # Une source qui a trouvé le pilote sans pouvoir conclure explique pourquoi ; sinon, on dit
+            # pourquoi aucune source n'a pu le vérifier.
+            note = (" ".join(dict.fromkeys(c.note for c in own if c.note))
+                    or " ".join(driver_sources.no_api_notes(ctx, ref, consulted)))
+        if status == VENDOR_UPDATE:
+            check_note = best.note
+        elif status == VERIFIED:
+            check_note = " ".join(dict.fromkeys(c.note for c in comparable if c.note))
+        else:
+            check_note = ""
 
         # Regroupe les nombreux composants identiques du chipset / des contrôleurs.
         group_key = (cls, vendor.name, status)
@@ -302,7 +319,7 @@ def analyse(
             explanation=_explain(status, vendor, d.provider, version_text, latest, d.date, source,
                                  problem.error_text if problem else "",
                                  basic_display="basic display" in d.device_name.lower(),
-                                 nvidia_auto=bool(nv and nv.download_url)),
+                                 nvidia_auto=bool(nv and nv.download_url), note=check_note),
             latest_version=matched[0].title if matched else latest,
             wu_update_ids=[u.update_id for u in matched],
             nvidia_driver=nv,
