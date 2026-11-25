@@ -18,6 +18,12 @@ DEFAULTS: dict[str, Any] = {
     "create_restore_point": True,    # avant l'installation de pilotes
     "drivers_third_party_only": True,
     "bigfiles_min_mb": 100,
+    "backup_sources": None,          # dossiers cochés (None = choix par défaut)
+    "backup_custom": [],             # dossiers ajoutés par l'utilisateur
+    "backup_destination": "",
+    "backup_mode": "incremental",    # full | differential | incremental
+    "backup_keep_full": 0,           # 0 = tout garder
+    "backup_last": {},               # dernière sauvegarde réussie (date, type, destination)
 }
 
 

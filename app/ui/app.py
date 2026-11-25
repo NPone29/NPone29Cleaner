@@ -12,6 +12,7 @@ from app.config import APP_NAME, APP_VERSION
 from app.core.drivers import WindowsUpdateDriverService
 from app.ui import theme
 from app.ui.pages.assistant import AssistantPage
+from app.ui.pages.backup import BackupPage
 from app.ui.pages.base import Page
 from app.ui.pages.bigfiles import BigFilesPage
 from app.ui.pages.cleaner import CleanerPage
@@ -36,6 +37,7 @@ NAVIGATION: list[tuple[str, str, str, type[Page]]] = [
     ("dashboard", "Tableau de bord", "", DashboardPage),
     ("assistant", "Entretien guidé", "", AssistantPage),
     ("hardware", "Mon PC", "", HardwarePage),
+    ("backup", "Sauvegarde", "", BackupPage),
     ("cleaner", "Nettoyage", "", CleanerPage),
     ("drivers", "Pilotes", "", DriversPage),
     ("software", "Logiciels", "", SoftwarePage),

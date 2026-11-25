@@ -97,6 +97,7 @@ class VendorCheck:
     download_url: str = ""         # fichier officiel à télécharger
     extra: object = None           # données propres à la source (ex. pilote NVIDIA installable)
     comparable: bool = True        # False si les versions n'ont pas pu être comparées
+    note: str = ""                 # précision affichée à l'utilisateur (ex. paquet déjà installé)
 
 
 @dataclass
@@ -170,6 +171,19 @@ def compare_versions(a: str, b: str) -> int | None:
     width = max(len(pa), len(pb))
     pa, pb = pa + (0,) * (width - len(pa)), pb + (0,) * (width - len(pb))
     return (pa > pb) - (pa < pb)
+
+
+def same_numbering(a: str, b: str) -> bool:
+    """True si deux versions suivent visiblement la même numérotation (donc comparables entre elles).
+
+    Un paquet de fabricant porte souvent sa propre version, différente de celle du pilote qu'il installe
+    (paquet Intel Ethernet 20.0.3.28 -> pilote 12.19.2.66). On exige le même nombre de nombres et le
+    même premier nombre (10.1.50.1 / 10.1.46.3), ou le même deuxième (32.0.101.7085 / 30.0.101.2079).
+    """
+    pa, pb = version_parts(a), version_parts(b)
+    if pa is None or pb is None or len(pa) != len(pb):
+        return False
+    return pa[0] == pb[0] or (len(pa) >= 3 and pa[1] == pb[1])
 
 
 def newest(versions: list[str]) -> str:
@@ -254,6 +268,9 @@ def extract_cab(cab: Path) -> Path:
         if not result.ok or len(files) != 1:
             raise IOError(f"Extraction impossible de {cab.name}")
         files[0].replace(target)
+        # expand.exe conserve la date interne de l'archive : sans cela le fichier paraîtrait toujours plus
+        # ancien que le .cab et serait ré-extrait (57 Mo pour Dell) à chaque analyse.
+        os.utime(target)
         return target
     finally:
         shutil.rmtree(workdir, ignore_errors=True)
