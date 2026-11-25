@@ -10,6 +10,7 @@ et des logiciels, et les petits outils d'entretien du quotidien.
 | **Tableau de bord** | Infos système, utilisation CPU/RAM en direct, espace disque, accès à l'entretien guidé. |
 | **Entretien guidé** | Assistant en 5 étapes (fichiers inutiles → nettoyage → pilotes → logiciels → démarrage) qui demande l'accord de l'utilisateur avant chaque action et termine par un bilan. |
 | **Mon PC** | Carte interactive du matériel (processeur, mémoire et emplacements libres, carte graphique, disques, réseau, audio, écran, ventilation, batterie) avec explications simples, caractéristiques, conseils et températures en direct. Bouton « Copier la configuration ». |
+| **Sauvegarde** | Copie les dossiers choisis (Documents, Bureau, Images… ou tout autre dossier) sur un disque externe, une clé USB ou un dossier réseau. Sauvegarde **complète**, **différentielle** ou **incrémentale**, au choix. Les fichiers sont copiés **en clair** et restent lisibles directement depuis le disque, même sans l'application. Onglet Restaurer : restauration exacte à la date choisie (dans un dossier ou à l'emplacement d'origine), recherche d'un fichier, ouverture directe, vérification, suppression des anciennes sauvegardes. Prévient si la destination est sur le même disque physique que les données. |
 | **Nettoyage** | Analyse puis supprime : corbeille, fichiers temporaires, miniatures, rapports de plantage, cache Windows Update, Delivery Optimization, shaders DirectX/NVIDIA/AMD, journaux, caches de Chrome / Edge / Brave / Vivaldi / Opera / Firefox, Discord, Steam, Teams, Spotify, VS Code, pip, npm. Prévient si un navigateur ouvert bloque une partie du nettoyage, puis affiche un bilan (espace libre avant → après). |
 | **Pilotes** | **Analyse complète** de chaque périphérique avec trois états honnêtes : **À jour (vérifié)**, **Mise à jour disponible**, **Non vérifiable**. Un pilote n'est jamais affiché « à jour » sans source fiable : Windows Update, nvidia.com (cartes NVIDIA) ou le catalogue officiel du fabricant pour les PC **Dell**, **HP** et **Lenovo**. Chaque ligne indique la source utilisée et la date de la vérification. Bouton **Télécharger** vers la page la plus précise : fichier ou page exacte du pilote quand la source la fournit, sinon page de support pré-remplie (modèle du PC / de la carte mère, ID matériel dans le Catalogue Microsoft). Quand un fabricant n'a pas de service public (Intel, AMD, Realtek, ASUS, MSI, Gigabyte, ASRock, Acer…), l'interface le dit au lieu de deviner. Installation automatique via Windows Update ou de l'installateur NVIDIA officiel (signature vérifiée). Point de restauration automatique, inventaire, périphériques en erreur. |
 | **Logiciels** | Liste les logiciels à mettre à jour et les met à jour en silence via **winget**. |
@@ -47,6 +48,35 @@ Thème sombre / clair / système, réglages mémorisés dans `%APPDATA%\NPone29C
   entier et filtré sur le PC avec l'identifiant de modèle (SKU). **Jamais** de numéro de série ni de service
   tag. L'inventaire « Mon PC » reste sur le PC.
 - Les catalogues sont gardés 24 h dans `%LOCALAPPDATA%\NPone29Cleaner\cache\drivers`.
+- PC Dell : la version d'un paquet Dell n'est souvent pas celle du pilote qu'il installe (paquet Intel Ethernet
+  20.0.3.28 → pilote 12.19.2.66). L'application lit donc, sur le PC uniquement, les journaux des paquets Dell
+  déjà installés (`C:\ProgramData\Dell\UpdatePackage\Log`) : un paquet installé avec succès n'est plus redemandé.
+  Si les numérotations diffèrent et qu'aucun journal n'existe, le pilote est « Non vérifiable » plutôt que
+  faussement « à mettre à jour ».
+
+### Sauvegarde : organisation sur le disque
+
+```
+<disque>\NPone29 Sauvegardes\<NOM-DU-PC>\
+    LISEZMOI.txt                      comment restaurer, avec ou sans l'application
+    NPone29Cleaner.exe                copie de l'application (version .exe uniquement)
+    2026-11-25_14h30_Complete\
+        Documents\...  Images\...     les fichiers, tels quels
+        _sauvegarde.json              description (écrite en dernier = sauvegarde terminée)
+        _inventaire.json.gz           liste de TOUS les fichiers à cette date + où se trouve leur copie
+        RESTAURER.bat                 restauration de secours sans l'application (robocopy)
+    2026-11-26_09h00_Incrementale\    uniquement les fichiers nouveaux ou modifiés
+```
+
+- Un fichier est considéré comme modifié si sa taille ou sa date de modification a changé.
+- Chaque inventaire décrit l'état complet des dossiers : une restauration à une date donnée ne fait pas
+  réapparaître les fichiers supprimés entre-temps.
+- Une sauvegarde interrompue (arrêt, disque plein, débranché) n'est jamais utilisée comme base ; elle est
+  signalée et peut être supprimée.
+- Fichiers ignorés : fichiers temporaires (`~$*`, `*.tmp`, `Thumbs.db`, `desktop.ini`…), liens et jonctions,
+  fichiers OneDrive « disponibles en ligne uniquement » (déjà dans le cloud).
+- Les fichiers ouverts en écriture par un programme (ex. fichier `.pst` d'Outlook ouvert) ne peuvent pas être
+  copiés : ils sont listés à la fin et l'ancienne copie éventuelle est conservée.
 
 ## Lancer en développement
 
@@ -114,6 +144,7 @@ app/
     startup.py             programmes au démarrage
     uninstaller.py         programmes installés
     bigfiles.py            recherche des gros fichiers
+    backup.py              sauvegarde complète/différentielle/incrémentale, restauration, vérification
     maintenance.py         outils (DNS, SFC, DISM…)
     sysinfo.py             infos système
   ui/                    Interface CustomTkinter
@@ -155,6 +186,7 @@ elle apparaît automatiquement dans l'interface.
 
 - Vérification en ligne pour d'autres fabricants (AMD, Intel) si un service officiel apparaît
 - Recherche de fichiers en double
-- Nettoyage planifié (tâche Windows)
+- Nettoyage et sauvegarde planifiés (tâche Windows)
+- Sauvegarde des fichiers ouverts (clichés instantanés VSS, droits administrateur)
 - Installeur (Inno Setup) et signature de l'exe
 - Mise à jour automatique de l'application elle-même
