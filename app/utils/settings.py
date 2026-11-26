@@ -28,6 +28,9 @@ DEFAULTS: dict[str, Any] = {
     "backup_auto_hours": 24,         # fréquence en heures (1, 2, 4, 6, 12, 24, 168)
     "backup_auto_mode": "incremental",
     "backup_auto_full_weeks": 0,     # une complète toutes les N semaines (0 = jamais)
+    "update_check": True,            # cherche une nouvelle version au démarrage
+    "update_skip": "",               # version que l'utilisateur a choisi d'ignorer
+    "drivers_detail_lines": 5,       # lignes de description visibles sous la liste des pilotes
 }
 
 

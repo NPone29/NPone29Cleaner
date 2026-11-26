@@ -1,5 +1,7 @@
 # NPone29 Cleaner
 
+Hey, voici le seul texte, à part les prompts, que j'ai écrit moi-même. J'en avais marre de CCleaner, qui était un peu comme un virus : il s'ouvrait sans raison alors qu'on ne lui avait rien demandé. En plus, presque tout y est payant. J'ai donc eu l'idée de demander à Claude de me générer cette application. C'était vraiment génial de voir les progrès de l'application à chaque prompt. Mes pilotes et mes applications sont à jour, tout est nickel.
+
 Application Windows **gratuite** qui réunit le nettoyage du PC, la mise à jour des pilotes
 et des logiciels, et les petits outils d'entretien du quotidien.
 
@@ -139,23 +141,64 @@ python -m venv .venv
 Sans droits administrateur, l'application fonctionne en **mode limité** (un bandeau propose de la
 relancer en administrateur). Option `--debug` pour un journal détaillé.
 
-## Créer le .exe
+## Créer le .exe et l'installateur
 
 Double-cliquez sur **`build.bat`** (ou `powershell -ExecutionPolicy Bypass -File build.ps1`).
 Le script installe les dépendances, lance les tests puis produit :
 
 ```
-dist\NPone29Cleaner.exe   (≈ 15 Mo, un seul fichier, aucune installation nécessaire)
+dist\NPone29Cleaner.exe               (≈ 15 Mo) version portable : un seul fichier, aucune installation
+dist\NPone29Cleaner-Setup-<version>.exe (≈ 17 Mo) installateur, recommandé pour la diffusion
 ```
 
-Ce fichier se copie et se lance sur n'importe quel PC Windows 10/11 64 bits, sans Python.
-Il demande les droits administrateur au démarrage (nécessaires pour les pilotes et les fichiers système).
+Les deux se lancent sur n'importe quel PC Windows 10/11 64 bits, sans Python. L'application s'ouvre
+normalement, sans demander les droits administrateur : les fonctions qui en ont besoin (pilotes, fichiers
+système, sauvegarde automatique…) proposent « Relancer en administrateur ». Clic droit > « Exécuter en tant
+qu'administrateur » l'ouvre directement avec ces droits.
+
+L'installateur nécessite [Inno Setup 6](https://jrsoftware.org/isinfo.php) sur le PC qui compile
+(`winget install JRSoftware.InnoSetup`) ; sans lui, seule la version portable est créée. Script :
+`installer\NPone29Cleaner.iss` (la version est lue dans `app\config.py`). L'installateur :
+
+- installe l'application dans `C:\Program Files\NPone29 Cleaner` : un emplacement fixe, que la sauvegarde
+  automatique planifiée retrouve toujours (la version portable, elle, ne doit pas être déplacée une fois la
+  sauvegarde automatique activée) ;
+- crée un raccourci dans le menu Démarrer (et sur le Bureau si on le coche) ;
+- remplace la version précédente lors d'une mise à jour, en fermant l'application si elle est ouverte ;
+- se désinstalle depuis Paramètres > Applications, en supprimant aussi la tâche de sauvegarde automatique ;
+  les réglages (`%APPDATA%\NPone29Cleaner`) et les sauvegardes sont conservés.
+
+Test sans fenêtre ni droits administrateur (dossier au choix, désinstallation par `unins000.exe /VERYSILENT`) :
+`NPone29Cleaner-Setup-<version>.exe /CURRENTUSER /VERYSILENT /DIR="C:\Temp\test"`.
 
 > **Antivirus / SmartScreen** : les .exe créés avec PyInstaller et non signés sont parfois signalés
 > à tort. Pour une distribution publique, il faudra signer l'exécutable (certificat de signature de code)
 > ou le soumettre à Microsoft comme faux positif.
 
 Vérification automatique de l'exe : `NPone29Cleaner.exe --selftest` ouvre chaque page puis se ferme.
+
+## Mises à jour de l'application
+
+Au démarrage, l'application consulte la liste publique des releases du dépôt GitHub (`UPDATE_REPO` dans
+`app\config.py`, via `api.github.com` ; aucune donnée personnelle n'est envoyée). Si une version plus récente
+existe, un bandeau la propose : **Installer maintenant**, **Nouveautés** ou **Ignorer cette version**. La page
+Outils permet aussi de chercher une mise à jour à la main. Rien n'est téléchargé sans l'accord de l'utilisateur.
+
+- **Version installée** (installateur) : l'installateur de la nouvelle version est téléchargé depuis
+  `github.com` uniquement, son empreinte SHA-256 est comparée à celle calculée par GitHub, puis il est lancé en
+  mode silencieux. Il attend la fermeture de l'application, remplace les fichiers et la rouvre (quelques
+  secondes). En cas d'échec, l'ancienne version reste en place et se rouvre.
+- **Version portable** : le bandeau ouvre la page de la release pour télécharger la nouvelle version.
+- Les **pré-versions** (bêta) ne sont proposées qu'aux personnes qui utilisent déjà une bêta (ex. `1.4.0-beta.1`).
+- Une recherche impossible (pas d'Internet, GitHub indisponible) est ignorée en silence au démarrage.
+
+**Publier une version** : changer la version dans `app\config.py` et `version_info.txt`, commiter sur `main`,
+lancer `build.bat`, puis `publish.ps1` (ou `publish.ps1 -Beta` pour une pré-version). Le script crée la release
+`v<version>` avec l'installateur et le .exe portable ; les utilisateurs se la verront proposer au démarrage
+suivant.
+
+> Le dépôt (ou un dépôt dédié aux releases, à indiquer dans `UPDATE_REPO`) doit être **public** : l'application
+> lit les releases sans compte GitHub.
 
 ## Tests
 
@@ -191,6 +234,7 @@ app/
     backup.py              sauvegarde complète/différentielle/incrémentale, restauration, vérification
     backup_schedule.py     sauvegarde automatique : échéance, tâche planifiée, verrou, mode --backup
     packages.py            installateurs officiels (NVIDIA, Intel) : téléchargement, empreinte, signature
+    app_update.py          mises à jour de l'application (releases GitHub, installateur silencieux)
     maintenance.py         outils (DNS, SFC, DISM…)
     sysinfo.py             infos système
   ui/                    Interface CustomTkinter
@@ -202,6 +246,8 @@ app/
 tests/                   Tests pytest
 tools/make_icon.py       Génère assets/icon.ico
 NPone29Cleaner.spec      Configuration PyInstaller
+installer/               Script de l'installateur (Inno Setup)
+publish.ps1              Publication d'une release GitHub (mise à jour proposée aux utilisateurs)
 ```
 
 Journal de l'application : `%LOCALAPPDATA%\NPone29Cleaner\logs\app.log` (bouton dans la page Outils).
@@ -246,5 +292,4 @@ elle apparaît automatiquement dans l'interface.
 - Nettoyage planifié (tâche Windows)
 - État de la sauvegarde automatique sur le Tableau de bord
 - Sauvegarde des fichiers ouverts (clichés instantanés VSS, droits administrateur)
-- Installeur (Inno Setup) et signature de l'exe
-- Mise à jour automatique de l'application elle-même
+- Signature de l'exe et de l'installateur (certificat de signature de code)

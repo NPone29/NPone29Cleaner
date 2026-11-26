@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import customtkinter as ctk
 
+from app.config import APP_NAME, APP_VERSION
 from app.core.drivers import create_restore_point
 from app.core.maintenance import ACTIONS, MaintenanceAction
 from app.ui import theme
@@ -34,6 +35,9 @@ class ToolsPage(Page):
                               lambda: create_restore_point("NPone29 Cleaner — point manuel"),
                               admin=True, background=True),
             *ACTIONS,
+            MaintenanceAction("app_update", f"Mises à jour de {APP_NAME}",
+                              f"Version {APP_VERSION}. Cherche une version plus récente et propose de l'installer.",
+                              lambda: self.app.check_update(manual=True)),
             MaintenanceAction("logs", "Journal de l'application",
                               "Ouvre le dossier des journaux (utile pour signaler un problème).",
                               lambda: open_path(log_dir())),

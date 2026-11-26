@@ -3,12 +3,17 @@
 from __future__ import annotations
 
 import logging
+import os
+import sys
+import threading
 import tkinter.font as tkfont
 import traceback
 
 import customtkinter as ctk
 
 from app.config import APP_NAME, APP_VERSION
+from app.core import app_update
+from app.core.app_update import Release
 from app.core.drivers import WindowsUpdateDriverService
 from app.ui import theme
 from app.ui.pages.assistant import AssistantPage
@@ -24,11 +29,12 @@ from app.ui.pages.startup import StartupPage
 from app.ui.pages.tools import ToolsPage
 from app.ui.pages.uninstall import UninstallPage
 from app.ui.tasks import UiDispatcher
-from app.ui.widgets import ResultDialog, Toast, show_error
+from app.ui.widgets import (ResultDialog, Toast, ask_yes_no, install_fast_scrolling, neutral_button,
+                            show_error, show_info, show_warning, success_button)
 from app.utils import notify as winnotify
 from app.utils.paths import resource_path
 from app.utils.settings import Settings
-from app.utils.system import is_admin, relaunch_as_admin
+from app.utils.system import is_admin, open_url, relaunch_as_admin
 
 log = logging.getLogger(__name__)
 
@@ -48,6 +54,60 @@ NAVIGATION: list[tuple[str, str, str, type[Page]]] = [
 ]
 
 APPEARANCES = {"Sombre": "dark", "Clair": "light", "Système": "system"}
+
+
+class UpdateBanner(ctk.CTkFrame):
+    """Bandeau « Nouvelle version disponible » en haut de la fenêtre."""
+
+    TEXT_COLOR = ("#1e3a8a", "#bfdbfe")
+
+    def __init__(self, master, window: "MainWindow", release: Release):
+        super().__init__(master, fg_color=("#e8f0fe", "#1c2a45"), corner_radius=10)
+        self.window = window
+        self.release = release
+        self.label = ctk.CTkLabel(self, text="", font=theme.font(12), text_color=self.TEXT_COLOR, anchor="w",
+                                  justify="left", wraplength=560)
+        self.label.pack(side="left", padx=14, pady=10, fill="x", expand=True)
+        self.buttons = ctk.CTkFrame(self, fg_color="transparent")
+        self.buttons.pack(side="right", padx=10, pady=8)
+        self.bar = ctk.CTkProgressBar(self, width=160, height=8)
+        self._downloading = False
+        self.show_available()
+
+    def _set_buttons(self, *buttons: tuple[str, object, str]) -> None:
+        for child in self.buttons.winfo_children():
+            child.destroy()
+        for text, command, kind in buttons:
+            make = success_button if kind == "primary" else neutral_button
+            make(self.buttons, text, command, width=10).pack(side="left", padx=4)
+
+    def show_available(self) -> None:
+        r = self.release
+        installable = app_update.can_install(r)
+        beta = " (bêta)" if r.prerelease else ""
+        self._downloading = False
+        self.bar.pack_forget()
+        self.label.configure(text=f"Nouvelle version disponible : {r.version}{beta} (vous avez la {APP_VERSION}).")
+        main = ("Installer maintenant", lambda: self.window.install_update(r), "primary") if installable else \
+            ("Télécharger", lambda: self.window.install_update(r), "primary")
+        self._set_buttons(main, ("Nouveautés", lambda: open_url(r.page_url), ""),
+                          ("Ignorer cette version", self.window.skip_update, ""))
+
+    def show_progress(self, done: int, total: int) -> None:
+        pct = f" {done * 100 // total} %" if total else ""
+        self.label.configure(text=f"Téléchargement de la version {self.release.version}…{pct}")
+        if not self._downloading:
+            self._downloading = True
+            self.bar.pack(side="right", padx=(6, 4))     # à gauche des boutons
+            self._set_buttons(("Annuler", self.window.cancel_update, ""))
+        self.bar.set(done / total if total else 0)
+
+    def show_installing(self) -> None:
+        self._downloading = False
+        self.bar.pack_forget()
+        self._set_buttons()
+        self.label.configure(text=f"Installation de la version {self.release.version} : l'application va se "
+                                  "fermer puis se rouvrir toute seule…")
 
 
 class NavItem(ctk.CTkFrame):
@@ -106,6 +166,7 @@ class MainWindow(ctk.CTk):
         self.icon_family = self._icon_font_family()
 
         theme.apply_treeview_style(self)
+        install_fast_scrolling()
 
         self.grid_columnconfigure(1, weight=1)
         self.grid_rowconfigure(0, weight=1)
@@ -115,6 +176,10 @@ class MainWindow(ctk.CTk):
         self.content.grid(row=0, column=1, sticky="nsew")
         self.content.grid_columnconfigure(0, weight=1)
         self.content.grid_rowconfigure(1, weight=1)
+        # Bandeaux en haut de la page (mode limité, nouvelle version), affichés seulement s'il y en a.
+        self.banner_area = ctk.CTkFrame(self.content, fg_color="transparent")
+        self.update_banner: UpdateBanner | None = None
+        self._update_cancel: threading.Event | None = None
         if not self.admin:
             self._build_admin_banner()
 
@@ -131,6 +196,8 @@ class MainWindow(ctk.CTk):
         self.protocol("WM_DELETE_WINDOW", self.on_close)
         if not self.settings.get("welcome_done", False):
             self.after(700, self._show_welcome)
+        if "--selftest" not in sys.argv:
+            self.after(4000, self.check_update)
 
     # ------------------------------------------------------------------ construction
     def _icon_font_family(self) -> str:
@@ -177,9 +244,13 @@ class MainWindow(ctk.CTk):
         ctk.CTkLabel(bottom, text=f"Version {APP_VERSION} • gratuit", font=theme.font(11),
                      text_color=theme.MUTED, anchor="w").pack(anchor="w")
 
+    def _show_banner_area(self) -> None:
+        self.banner_area.grid(row=0, column=0, sticky="ew", padx=28, pady=(18, 0))
+
     def _build_admin_banner(self) -> None:
-        banner = ctk.CTkFrame(self.content, fg_color=("#fff4e5", "#3a2e17"), corner_radius=10)
-        banner.grid(row=0, column=0, sticky="ew", padx=28, pady=(18, 0))
+        self._show_banner_area()
+        banner = ctk.CTkFrame(self.banner_area, fg_color=("#fff4e5", "#3a2e17"), corner_radius=10)
+        banner.pack(fill="x", pady=(0, 6))
         ctk.CTkLabel(
             banner, text="Mode limité : certaines fonctions (pilotes, fichiers système, démarrage global) "
                          "nécessitent les droits administrateur.",
@@ -282,6 +353,124 @@ class MainWindow(ctk.CTk):
                      ("Découvrir la carte de mon PC", lambda: self.show_page("hardware"))],
             level="info", close_text="Explorer par moi-même", actions_title="Par où commencer ?")
 
+    # ------------------------------------------------------------------ mises à jour de l'application
+    def check_update(self, manual: bool = False) -> None:
+        """Cherche une nouvelle version (au démarrage, ou depuis la page Outils avec `manual`)."""
+        if not manual and not self.settings.get("update_check", True):
+            return
+
+        def done(release: Release | None) -> None:
+            if release is None:
+                if manual:
+                    show_info(self, "Mises à jour", f"Vous avez la dernière version de {APP_NAME} ({APP_VERSION}).")
+                return
+            if not manual and release.version == self.settings.get("update_skip", ""):
+                return
+            self._show_update_banner(release)
+
+        def failed(exc: BaseException) -> None:
+            log.info("Recherche de mise à jour impossible : %s", exc)
+            if manual:
+                show_warning(self, "Mises à jour", str(exc))
+
+        self.dispatcher.run(app_update.check_for_update, on_done=done, on_error=failed)
+
+    def _show_update_banner(self, release: Release) -> None:
+        if self.update_banner is not None:
+            if self._update_cancel is not None:
+                return     # téléchargement en cours
+            self.update_banner.destroy()
+        self._show_banner_area()
+        self.update_banner = UpdateBanner(self.banner_area, self, release)
+        self.update_banner.pack(fill="x", pady=(0, 6))
+
+    def _hide_update_banner(self) -> None:
+        if self.update_banner is not None:
+            self.update_banner.destroy()
+            self.update_banner = None
+        if not self.banner_area.winfo_children():
+            self.banner_area.grid_forget()
+
+    def skip_update(self) -> None:
+        if self.update_banner is not None:
+            self.settings.set("update_skip", self.update_banner.release.version)
+            self.settings.save()
+        self._hide_update_banner()
+        self.notify("Version ignorée", "Elle ne sera plus proposée au démarrage. Vous pourrez toujours l'installer "
+                                       "depuis la page Outils.", "info")
+
+    def _busy_pages(self) -> list[str]:
+        labels = {pid: label for pid, label, _g, _c in NAVIGATION}
+        return [labels.get(pid, pid) for pid, page in self.pages.items()
+                if getattr(page, "busy", False) or getattr(page, "running", False)]
+
+    def install_update(self, release: Release) -> None:
+        kind = app_update.install_kind()
+        if not app_update.can_install(release, kind):
+            if kind == "portable":
+                show_info(self, "Nouvelle version",
+                          f"La page de la version {release.version} va s'ouvrir.\n\nTéléchargez « "
+                          f"{release.setup.name if release.setup else app_update.PORTABLE_NAME} » : l'installateur "
+                          "permet ensuite les mises à jour automatiques.")
+            open_url(release.page_url)
+            return
+        busy = self._busy_pages()
+        if busy:
+            show_warning(self, "Opération en cours",
+                         f"Attendez la fin de l'opération en cours ({', '.join(busy)}) avant de mettre à jour "
+                         "l'application.")
+            return
+        notes = app_update.short_notes(release.notes)
+        if not ask_yes_no(self, "Mettre à jour NPone29 Cleaner",
+                          f"Installer la version {release.version} (vous avez la {APP_VERSION}) ?\n\n"
+                          + (f"Nouveautés :\n{notes}\n\n" if notes else "")
+                          + "L'application va se fermer, s'installer puis se rouvrir toute seule. "
+                            "Vos réglages et vos sauvegardes sont conservés."):
+            return
+        self._update_cancel = cancel = threading.Event()
+        progress = self.dispatcher.wrap(self._update_progress)
+        if self.update_banner is None:
+            self._show_update_banner(release)
+        self.update_banner.show_progress(0, 0)
+        self.dispatcher.run(app_update.download_installer, release, progress, cancel,
+                            on_done=self._launch_update, on_error=self._update_failed)
+
+    def _update_progress(self, done: int, total: int) -> None:
+        if self.update_banner is not None and self._update_cancel is not None:
+            self.update_banner.show_progress(done, total)
+
+    def cancel_update(self) -> None:
+        if self._update_cancel is not None:
+            self._update_cancel.set()
+
+    def _launch_update(self, path) -> None:
+        self._update_cancel = None
+        if self.update_banner is not None:
+            self.update_banner.show_installing()
+        try:
+            app_update.launch_installer(path)
+        except OSError as exc:
+            self._update_failed(exc)
+            return
+        self.after(1500, self._exit_for_update)
+
+    def _exit_for_update(self) -> None:
+        """Ferme l'application tout de suite : l'installateur attend sa fin pour remplacer le .exe."""
+        self.on_close()
+        logging.shutdown()
+        os._exit(0)     # sans attendre un éventuel appel Windows Update bloqué en arrière-plan
+
+    def _update_failed(self, exc: BaseException) -> None:
+        from app.utils.download import DownloadCancelled
+
+        self._update_cancel = None
+        if self.update_banner is not None:
+            self.update_banner.show_available()
+        if isinstance(exc, DownloadCancelled):
+            return
+        log.warning("Mise à jour de l'application impossible : %s", exc)
+        show_warning(self, "Mise à jour impossible", f"{exc}\n\nRien n'a été modifié : vous pouvez réessayer plus tard.")
+
     # ------------------------------------------------------------------ divers
     def restart_as_admin(self) -> None:
         if relaunch_as_admin():
@@ -297,6 +486,7 @@ class MainWindow(ctk.CTk):
             pass
 
     def on_close(self) -> None:
+        self.cancel_update()
         for page in self.pages.values():
             try:
                 page.on_hide()
