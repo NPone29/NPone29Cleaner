@@ -4,7 +4,8 @@ On croise :
   1. les pilotes installés (WMI),
   2. les mises à jour proposées par Windows Update (installables automatiquement),
   3. les périphériques signalés en erreur,
-  4. les sources officielles des fabricants (app/core/driver_sources) : NVIDIA, Dell, HP, Lenovo.
+  4. les sources officielles (app/core/driver_sources) : NVIDIA, Dell, HP, Lenovo et le Catalogue
+     Microsoft Update (pilotes de tous les fabricants, classés selon les règles de Windows).
 Un pilote n'est affiché « à jour » que si une source fiable l'a vérifié. Sinon il est
 « non vérifiable » et l'application propose le lien officiel le plus précis.
 """
@@ -20,20 +21,22 @@ from app.core import driver_sources, drivers, nvidia
 from app.core.driver_sources import DeviceRef, DownloadLink, SystemContext, VendorCheck
 from app.core.driver_sources.base import newest
 from app.core.driver_sources.boards import pc_target
-from app.core.drivers import DriverUpdate, InstalledDriver, ProblemDevice
+from app.core.driver_sources.microsoft_catalog import CatalogDriver
+from app.core.drivers import DeviceIds, DriverUpdate, InstalledDriver, ProblemDevice
 from app.core.vendors import Vendor, parse_ids, vendor_for
 
 log = logging.getLogger(__name__)
 
 # Statuts, du plus urgent au moins urgent.
 PROBLEM, UPDATE, VENDOR_UPDATE, GENERIC = "problem", "update", "vendor_update", "generic"
-OLD, UNVERIFIED, VERIFIED = "old", "unverified", "verified"
-STATUS_ORDER = [PROBLEM, UPDATE, VENDOR_UPDATE, GENERIC, OLD, UNVERIFIED, VERIFIED]
+OPTIONAL, OLD, UNVERIFIED, VERIFIED = "optional", "old", "unverified", "verified"
+STATUS_ORDER = [PROBLEM, UPDATE, VENDOR_UPDATE, GENERIC, OPTIONAL, OLD, UNVERIFIED, VERIFIED]
 STATUS_LABELS = {
     PROBLEM: "⚠ Problème",
     UPDATE: "⬆ Mise à jour disponible",
     VENDOR_UPDATE: "⬆ Mise à jour disponible",
     GENERIC: "ℹ Pilote générique",
+    OPTIONAL: "ℹ Version générique dispo.",
     OLD: "? Non vérifiable (ancien)",
     UNVERIFIED: "? Non vérifiable",
     VERIFIED: "✓ À jour (vérifié)",
@@ -78,6 +81,8 @@ class DeviceStatus:
     checked_at: datetime | None = None
     no_api_note: str = ""           # pourquoi la version n'a pas pu être vérifiée
     count: int = 1   # nombre de composants regroupés sur cette ligne
+    catalog_driver: CatalogDriver | None = None    # pilote du Catalogue Microsoft installable automatiquement
+    device_ids: list[str] = field(default_factory=list)   # tous les périphériques regroupés sur cette ligne
 
     @property
     def status_label(self) -> str:
@@ -85,7 +90,8 @@ class DeviceStatus:
 
     @property
     def can_auto_install(self) -> bool:
-        return bool(self.wu_update_ids) or bool(self.nvidia_driver and self.nvidia_driver.download_url)
+        return (bool(self.wu_update_ids) or bool(self.nvidia_driver and self.nvidia_driver.download_url)
+                or self.catalog_driver is not None)
 
     @property
     def best_link(self) -> DownloadLink | None:
@@ -154,24 +160,27 @@ def _is_old(d: InstalledDriver, now: datetime) -> bool:
     return (now - d.date).days > OLD_AFTER_YEARS * 365
 
 
-def to_ref(d: InstalledDriver) -> DeviceRef:
+def to_ref(d: InstalledDriver, ids: DeviceIds | None = None) -> DeviceRef:
     """Le pilote installé tel que le voient les sources officielles (même clé que dans `analyse`)."""
     vendor = vendor_for(d.device_id, d.manufacturer or d.provider)
+    ids = ids or DeviceIds()
     return DeviceRef(key=d.device_id or d.device_name, name=d.device_name, device_id=d.device_id,
                      hardware_id=d.hardware_id, version=d.version, device_class=d.device_class,
-                     vendor_name=vendor.name)
+                     vendor_name=vendor.name, date=d.date, provider=d.provider, hardware_ids=ids.hardware_ids,
+                     compatible_ids=ids.compatible_ids, matching_id=ids.matching_id)
 
 
 def _explain(status: str, vendor: Vendor, provider: str, version: str, latest: str, date: datetime | None,
              source: str = "", problem: str = "", basic_display: bool = False, nvidia_auto: bool = False,
-             note: str = "") -> str:
+             note: str = "", catalog: CatalogDriver | None = None) -> str:
     text = _explain_status(status, vendor, provider, version, latest, date, source, problem, basic_display,
-                           nvidia_auto)
-    return f"{text} {note}" if note and status in (VENDOR_UPDATE, VERIFIED) else text
+                           nvidia_auto, catalog)
+    return f"{text} {note}" if note and status in (VENDOR_UPDATE, VERIFIED, OPTIONAL) else text
 
 
 def _explain_status(status: str, vendor: Vendor, provider: str, version: str, latest: str, date: datetime | None,
-                    source: str, problem: str, basic_display: bool, nvidia_auto: bool) -> str:
+                    source: str, problem: str, basic_display: bool, nvidia_auto: bool,
+                    catalog: CatalogDriver | None = None) -> str:
     if status == PROBLEM:
         return (f"Windows signale un problème : « {problem} ». Installer ou réinstaller le bon pilote "
                 "règle souvent le souci.")
@@ -179,10 +188,19 @@ def _explain_status(status: str, vendor: Vendor, provider: str, version: str, la
         return (f"Windows Update propose une version plus récente de ce pilote (fournie par {provider or vendor.name}). "
                 "L'installation est automatique : cochez-le puis cliquez sur « Installer automatiquement ».")
     if status == VENDOR_UPDATE:
-        action = ("L'application peut la télécharger depuis nvidia.com, vérifier sa signature et lancer "
-                  "l'installateur." if nvidia_auto else
-                  "Cliquez sur « Télécharger » : le fichier ou la page officielle s'ouvre dans votre navigateur.")
+        if nvidia_auto:
+            action = ("L'application peut la télécharger depuis nvidia.com, vérifier sa signature et lancer "
+                      "l'installateur.")
+        elif catalog is not None:
+            action = (f"Elle est prévue pour votre matériel et Windows la choisira à la place de l'actuelle. "
+                      f"L'application peut la télécharger depuis Microsoft ({catalog.size_text}), vérifier son "
+                      "empreinte et sa signature, puis l'installer.")
+        else:
+            action = "Cliquez sur « Télécharger » : le fichier ou la page officielle s'ouvre dans votre navigateur."
         return f"{source} propose la version {latest} (vous avez la {version}). {action}"
+    if status == OPTIONAL:
+        return (f"Votre pilote ({version}) est le plus récent prévu pour votre matériel, il fonctionne et reste "
+                "le choix recommandé.")
     if status == GENERIC:
         if basic_display:
             return ("Aucun vrai pilote graphique n'est installé : l'affichage et les jeux en souffrent. "
@@ -230,6 +248,7 @@ def analyse(
     used_updates: set[str] = set()
     rows: list[DeviceStatus] = []
     groups: dict[tuple, DeviceStatus] = {}
+    single_names: dict[int, str] = {}
 
     for d in installed:
         problem = problem_by_id.get(d.device_id.lower())
@@ -250,6 +269,7 @@ def analyse(
             top = newest([c.latest_version for c in newer])
             best = next((c for c in newer if c.latest_version == top), newer[0])
         nv = best.extra if best and isinstance(best.extra, nvidia.NvidiaDriver) else None
+        catalog = best.extra if best and isinstance(best.extra, CatalogDriver) else None
         is_nvidia_gpu = vendor.name == "NVIDIA" and cls == "DISPLAY"
         version_text = nvidia.windows_to_nvidia_version(d.version) if is_nvidia_gpu else d.version
 
@@ -270,7 +290,7 @@ def analyse(
         elif _is_generic(d, vendor):
             status = GENERIC
         elif comparable:
-            status = VERIFIED
+            status = OPTIONAL if any(c.generic_newer for c in comparable) else VERIFIED
         elif d.is_microsoft and wu_ok:
             status = VERIFIED
             source, checked_at = WINDOWS_UPDATE, now
@@ -287,22 +307,31 @@ def analyse(
                     or " ".join(driver_sources.no_api_notes(ctx, ref, consulted)))
         if status == VENDOR_UPDATE:
             check_note = best.note
-        elif status == VERIFIED:
+        elif status in (VERIFIED, OPTIONAL):
             check_note = " ".join(dict.fromkeys(c.note for c in comparable if c.note))
         else:
             check_note = ""
+        if status == OPTIONAL:
+            generic = [c for c in comparable if c.generic_newer]
+            latest = newest([c.latest_version for c in generic]) or generic[0].latest_version
+            source = ", ".join(dict.fromkeys(c.source for c in generic))
 
-        # Regroupe les nombreux composants identiques du chipset / des contrôleurs.
-        group_key = (cls, vendor.name, status)
-        grouped = status in (VERIFIED, UNVERIFIED) and cls in GROUPED_CLASSES and not show_all
+        # Regroupe les nombreux composants identiques du chipset / des contrôleurs. Une même mise à jour du
+        # catalogue (un seul paquet pour tout le chipset) tient aussi sur une seule ligne.
+        group_key = (cls, vendor.name, status, catalog.update_id if catalog else "")
+        grouped = cls in GROUPED_CLASSES and not show_all and (
+            status in (VERIFIED, UNVERIFIED) or (status == VENDOR_UPDATE and catalog is not None))
         if grouped:
             if group_key in groups:
                 group = groups[group_key]
                 group.count += 1
+                group.device_ids.append(d.device_id)
                 if group.version != version_text:
                     group.version = "plusieurs versions"
                 continue
             name = f"{vendor.name} — {category.lower()}"
+            if catalog is not None:
+                name += f" (pilote {catalog.version})"
         else:
             name = d.device_name
 
@@ -319,7 +348,8 @@ def analyse(
             explanation=_explain(status, vendor, d.provider, version_text, latest, d.date, source,
                                  problem.error_text if problem else "",
                                  basic_display="basic display" in d.device_name.lower(),
-                                 nvidia_auto=bool(nv and nv.download_url), note=check_note),
+                                 nvidia_auto=bool(nv and nv.download_url), note=check_note,
+                                 catalog=catalog if status == VENDOR_UPDATE else None),
             latest_version=matched[0].title if matched else latest,
             wu_update_ids=[u.update_id for u in matched],
             nvidia_driver=nv,
@@ -328,9 +358,12 @@ def analyse(
             checked_source=source,
             checked_at=checked_at,
             no_api_note=note,
+            catalog_driver=catalog if status == VENDOR_UPDATE else None,
+            device_ids=[d.device_id],
         )
         if grouped:
             groups[group_key] = row
+            single_names[id(row)] = d.device_name
         rows.append(row)
 
     # Mises à jour Windows Update qui ne correspondent à aucune ligne affichée.
@@ -370,6 +403,8 @@ def analyse(
     for row in rows:
         if row.count > 1:
             row.name = f"{row.name} ({row.count} composants)"
+        elif id(row) in single_names:     # un groupe d'un seul composant garde le vrai nom du périphérique
+            row.name = single_names[id(row)]
     rows.sort(key=lambda r: (STATUS_ORDER.index(r.status), r.category, r.name.lower()))
     board, product, _prebuilt = pc_target(ctx)
     board_text = f"{board.name} {product}" if board and product else product
@@ -397,20 +432,31 @@ def run_full_analysis(service: drivers.WindowsUpdateDriverService,
     step("Identification du PC et de la carte mère…")
     ctx = SystemContext.from_board_info(drivers.get_hardware_vendors())
 
+    # La recherche Windows Update (jusqu'à 2 minutes) tourne pendant la consultation des sources officielles.
     wu_ok = True
-    if reuse_search and service.last_results is not None:
-        updates = service.last_results
+    search = None
+    if not (reuse_search and service.last_results is not None):
+        search = service.search()
+
+    problem_ids = {p.device_id.lower() for p in problems if p.error_code not in (22, 45)}
+    selected = [d for d in installed if d.device_id.lower() in problem_ids or is_relevant(d, show_all)]
+    try:
+        ids = drivers.read_device_ids([d.device_id for d in selected])
+    except Exception:
+        log.warning("Identifiants matériels illisibles", exc_info=True)
+        ids = {}
+    refs = [to_ref(d, ids.get(d.device_id.lower())) for d in selected]
+    run = driver_sources.check_all(ctx, refs, step)
+
+    if search is None:
+        updates = service.last_results or []
     else:
         step("Recherche sur Windows Update (jusqu'à 2 minutes)…")
         try:
-            updates = service.search().result()
+            updates = search.result()
         except Exception as exc:
             updates, wu_ok = [], False
             notes.append(f"Windows Update indisponible : {exc}")
-
-    problem_ids = {p.device_id.lower() for p in problems if p.error_code not in (22, 45)}
-    refs = [to_ref(d) for d in installed if d.device_id.lower() in problem_ids or is_relevant(d, show_all)]
-    run = driver_sources.check_all(ctx, refs, step)
 
     report = analyse(installed, updates, problems, run.checks, ctx, wu_ok, show_all=show_all,
                      consulted=run.verified_by)

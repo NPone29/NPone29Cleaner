@@ -71,10 +71,21 @@ class DeviceRef:
     version: str
     device_class: str
     vendor_name: str
+    date: datetime | None = None          # date du pilote installé (DriverVer)
+    provider: str = ""                    # éditeur du pilote installé (« Microsoft » = pilote de Windows)
+    # Identifiants déclarés par le périphérique, du plus précis au moins précis, et celui qui a servi à
+    # choisir le pilote installé : c'est ainsi que Windows classe les pilotes (voir microsoft_catalog.py).
+    hardware_ids: tuple[str, ...] = ()
+    compatible_ids: tuple[str, ...] = ()
+    matching_id: str = ""
 
     @property
     def ids(self) -> tuple[str, str, str]:
         return parse_ids(self.device_id)
+
+    @property
+    def is_microsoft(self) -> bool:
+        return self.provider.strip().lower() in {"microsoft", "microsoft corporation"}
 
 
 @dataclass
@@ -98,6 +109,9 @@ class VendorCheck:
     extra: object = None           # données propres à la source (ex. pilote NVIDIA installable)
     comparable: bool = True        # False si les versions n'ont pas pu être comparées
     note: str = ""                 # précision affichée à l'utilisateur (ex. paquet déjà installé)
+    # Pilote à jour pour ce PC, mais le fabricant de la puce publie une version générique plus récente
+    # que Windows n'installe pas d'office (celle du fabricant du PC reste prioritaire).
+    generic_newer: bool = False
 
 
 @dataclass

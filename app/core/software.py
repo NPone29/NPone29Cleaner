@@ -7,7 +7,7 @@ import re
 import shutil
 from dataclasses import dataclass
 
-from app.utils.system import CommandResult, run_command
+from app.utils.system import CommandResult, run_cancellable, run_command
 
 log = logging.getLogger(__name__)
 
@@ -101,13 +101,19 @@ def list_upgrades() -> list[SoftwareUpdate]:
     return updates
 
 
-def upgrade(update: SoftwareUpdate) -> CommandResult:
-    """Met à jour un logiciel en mode silencieux."""
+UPGRADE_TIMEOUT = 20 * 60   # au-delà, l'installateur est considéré comme bloqué
+
+
+def upgrade(update: SoftwareUpdate, cancel=None, timeout: float = UPGRADE_TIMEOUT) -> CommandResult:
+    """Met à jour un logiciel en mode silencieux.
+
+    `cancel` (threading.Event) interrompt la mise à jour en cours (installateur bloqué, par exemple).
+    """
     args = ["winget", "upgrade", "--id", update.id, "--exact", "--silent",
             "--accept-package-agreements", *_COMMON_FLAGS]
     if update.source:
         args += ["--source", update.source]
-    result = run_command(args, timeout=1800)
+    result = run_cancellable(args, timeout=timeout, cancel=cancel)
     # Nettoie la sortie (barres de progression) pour l'affichage dans le journal.
     lines = [l for l in _clean_lines(result.stdout) if l.strip() and not set(l.strip()) <= set("█▒-\\|/ ")]
     return CommandResult(result.returncode, "\n".join(lines), result.stderr)

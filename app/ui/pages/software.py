@@ -2,12 +2,14 @@
 
 from __future__ import annotations
 
+import logging
 import threading
 
 import customtkinter as ctk
 
 from app.core import software
 from app.core.software import SoftwareUpdate
+from app.utils.system import RC_CANCELLED, RC_TIMEOUT, CommandResult
 from app.ui import theme
 from app.ui.pages.base import Page
 from app.ui.widgets import (PageHeader, ResultDialog, StatusLine, Stepper, Table, ask_yes_no, neutral_button,
@@ -15,6 +17,7 @@ from app.ui.widgets import (PageHeader, ResultDialog, StatusLine, Stepper, Table
 from app.utils.system import open_url
 
 STEPS = ["Rechercher", "Choisir", "Mettre à jour", "Terminé"]
+log = logging.getLogger(__name__)
 
 
 class SoftwarePage(Page):
@@ -24,7 +27,8 @@ class SoftwarePage(Page):
         super().__init__(master, app)
         self.updates: dict[str, SoftwareUpdate] = {}
         self.busy = False
-        self.cancel = threading.Event()
+        self.cancel = threading.Event()     # tout arrêter
+        self.skip = threading.Event()       # passer la mise à jour en cours
 
         self.grid_columnconfigure(0, weight=1)
         self.grid_rowconfigure(3, weight=3)
@@ -43,7 +47,8 @@ class SoftwarePage(Page):
         self.search_btn.pack(side="left")
         self.update_btn = success_button(bar, "Mettre à jour la sélection", self.start_upgrade, width=210)
         self.update_btn.pack(side="left", padx=8)
-        self.cancel_btn = neutral_button(bar, "Arrêter après l'actuel", self._cancel, width=10)
+        self.skip_btn = neutral_button(bar, "Passer celui-ci", self._skip_current, width=10)
+        self.cancel_btn = neutral_button(bar, "Tout arrêter", self._cancel, width=10)
 
         self.table = Table(self, [
             ("name", "Logiciel", 300, "w", True),
@@ -84,13 +89,26 @@ class SoftwarePage(Page):
         self.search_btn.configure(state=state)
         self.update_btn.configure(state=state)
         if busy and upgrading:
-            self.cancel_btn.pack(side="left")
+            self.skip_btn.configure(state="normal")
+            self.cancel_btn.configure(state="normal")
+            self.skip_btn.pack(side="left")
+            self.cancel_btn.pack(side="left", padx=8)
         else:
+            self.skip_btn.pack_forget()
             self.cancel_btn.pack_forget()
 
+    def _skip_current(self) -> None:
+        """Interrompt la mise à jour en cours (installateur bloqué) et passe à la suivante."""
+        self.skip.set()
+        self.status.set_text("Interruption de la mise à jour en cours, passage à la suivante…")
+
     def _cancel(self) -> None:
+        """Interrompt la mise à jour en cours et n'en lance pas d'autre."""
         self.cancel.set()
-        self.status.set_text("Arrêt après la mise à jour en cours…")
+        self.skip.set()
+        self.skip_btn.configure(state="disabled")
+        self.cancel_btn.configure(state="disabled")
+        self.status.set_text("Arrêt des mises à jour…")
 
     # ------------------------------------------------------------------ recherche
     def start_search(self) -> None:
@@ -136,33 +154,43 @@ class SoftwarePage(Page):
                           "Certaines installations peuvent demander une confirmation Windows (UAC)."):
             return
         self.cancel.clear()
+        self.skip.clear()
         self._set_busy(True, upgrading=True)
         self.stepper.set(2)
-        items = [self.updates[i] for i in ids]
+        items = [self.updates[i] for i in ids if i in self.updates]
         progress = self.dispatcher.wrap(self._on_progress)
+        cancel, skip = self.cancel, self.skip
 
-        def work() -> tuple[int, int]:
-            ok = fail = 0
+        def work() -> tuple[int, int, int]:
+            ok = fail = skipped = 0
             for index, item in enumerate(items):
-                if self.cancel.is_set():
+                if cancel.is_set():
                     break
+                skip.clear()
                 progress(index, len(items), item, None)
-                result = software.upgrade(item)
+                # Une mise à jour en erreur ne doit jamais bloquer les suivantes.
+                try:
+                    result = software.upgrade(item, cancel=skip)
+                except Exception as exc:
+                    log.exception("Mise à jour de %s impossible", item.id)
+                    result = CommandResult(-1, "", str(exc) or exc.__class__.__name__)
                 progress(index + 1, len(items), item, result)
                 if result.ok:
                     ok += 1
+                elif result.returncode == RC_CANCELLED:
+                    skipped += 1
                 else:
                     fail += 1
-            return ok, fail
+            return ok, fail, skipped
 
-        self.dispatcher.run(work, on_done=self._upgrade_done,
-                            on_error=lambda e: self.status.idle(f"Erreur : {e}"),
+        self.dispatcher.run(work, on_done=self._upgrade_done, on_error=self._upgrade_error,
                             on_finally=lambda: self._set_busy(False))
 
     def _on_progress(self, done: int, total: int, item: SoftwareUpdate, result) -> None:
         row = [item.name, item.id, item.version, item.available]
         if result is None:
-            self.status.progress(done / total, f"Mise à jour ({done + 1}/{total}) : {item.name}…")
+            self.status.progress(done / total, f"Mise à jour ({done + 1}/{total}) : {item.name}… "
+                                               "(bloquée ? cliquez sur « Passer celui-ci »)")
             self.table.update_row(item.id, row + ["En cours…"])
             self._write_log(f"▶ {item.name} ({item.version} → {item.available})")
             return
@@ -170,15 +198,34 @@ class SoftwarePage(Page):
             self.table.update_row(item.id, row + ["✓ À jour"], tags=("ok",))
             self.table.set_checked([item.id], False)
             self._write_log("   ✓ Terminé")
-        else:
-            self.table.update_row(item.id, row + [f"✗ Échec ({result.returncode})"], tags=("error",))
-            last = [l for l in result.output.splitlines() if l.strip()][-3:]
-            for line in last:
-                self._write_log(f"   {line}")
+            return
+        if result.returncode == RC_CANCELLED:
+            self.table.update_row(item.id, row + ["⏭ Passé"], tags=("muted",))
+            self._write_log("   ⏭ Interrompu : mise à jour passée")
+            return
+        label = "✗ Délai dépassé" if result.returncode == RC_TIMEOUT else f"✗ Échec ({result.returncode})"
+        self.table.update_row(item.id, row + [label], tags=("error",))
+        last = [l for l in result.output.splitlines() if l.strip()][-3:]
+        for line in last:
+            self._write_log(f"   {line}")
 
-    def _upgrade_done(self, counts: tuple[int, int]) -> None:
-        ok, fail = counts
-        self.status.idle(f"Terminé : {ok} mis à jour, {fail} échec(s).")
+    def _reset_pending_rows(self) -> None:
+        """Remet « Disponible » sur les lignes restées « En cours… » (arrêt ou erreur inattendue)."""
+        for item in self.updates.values():
+            values = self.table.row_values(item.id)
+            if values and values[-1] == "En cours…":
+                self.table.update_row(item.id, [item.name, item.id, item.version, item.available, "Disponible"])
+
+    def _upgrade_error(self, exc: BaseException) -> None:
+        self._reset_pending_rows()
+        self.stepper.set(1)
+        self.status.idle(f"Erreur : {exc}. Vous pouvez relancer la mise à jour de la sélection.")
+
+    def _upgrade_done(self, counts: tuple[int, int, int]) -> None:
+        ok, fail, skipped = counts
+        self._reset_pending_rows()
+        stopped = " Arrêt demandé : les logiciels restants n'ont pas été mis à jour." if self.cancel.is_set() else ""
+        self.status.idle(f"Terminé : {ok} mis à jour, {fail} échec(s), {skipped} passé(s).{stopped}")
         self.stepper.set(len(STEPS))
         self.app.notify("Mises à jour terminées", f"{ok} logiciel(s) mis à jour, {fail} échec(s).",
                         "success" if not fail else "warning")
@@ -186,8 +233,10 @@ class SoftwarePage(Page):
         if fail:
             tips.append("Un échec vient souvent d'un logiciel ouvert pendant la mise à jour : fermez-le et réessayez.")
             tips.append("Certains logiciels (ex. Microsoft Store, jeux) se mettent à jour par eux-mêmes.")
-        ResultDialog(self, "Mises à jour terminées", f"{ok} logiciel(s) mis à jour",
-                     [("Réussies", str(ok)), ("Échecs", str(fail))], tips,
+        if skipped:
+            tips.append("Les mises à jour passées restent cochées : vous pourrez les relancer plus tard.")
+        stats = [("Réussies", str(ok)), ("Échecs", str(fail))] + ([("Passées", str(skipped))] if skipped else [])
+        ResultDialog(self, "Mises à jour terminées", f"{ok} logiciel(s) mis à jour", stats, tips,
                      actions=[("Relancer la recherche", self.start_search),
                               ("Vérifier les pilotes", lambda: self.app.show_page("drivers").start_analysis())],
                      level="success" if not fail else "warning")

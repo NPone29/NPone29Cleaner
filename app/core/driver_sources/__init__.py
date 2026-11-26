@@ -15,6 +15,7 @@ from app.core.driver_sources.chipmakers import AmdSource, IntelSource, OtherVend
 from app.core.driver_sources.dell import DellSource
 from app.core.driver_sources.hp import HpSource
 from app.core.driver_sources.lenovo import LenovoSource
+from app.core.driver_sources.microsoft_catalog import MicrosoftCatalogSource
 from app.core.driver_sources.nvidia_source import NvidiaSource
 from app.core.vendors import microsoft_catalog_url, parse_ids
 from app.utils.download import is_allowed_url
@@ -23,7 +24,7 @@ log = logging.getLogger(__name__)
 
 # Ordre = priorité des liens d'une même nature et ordre des explications.
 SOURCES: list[DriverSource] = [
-    NvidiaSource(), DellSource(), HpSource(), LenovoSource(),
+    NvidiaSource(), DellSource(), HpSource(), LenovoSource(), MicrosoftCatalogSource(),
     *board_sources(),
     IntelSource(), AmdSource(), OtherVendorSource(),
 ]

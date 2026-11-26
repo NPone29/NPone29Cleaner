@@ -17,7 +17,7 @@ from datetime import datetime
 from typing import Callable
 
 from app.utils.fmt import parse_wmi_datetime
-from app.utils.system import CommandResult, run_command, run_powershell
+from app.utils.system import CommandResult, run_cancellable, run_command, run_powershell
 
 log = logging.getLogger(__name__)
 
@@ -260,6 +260,64 @@ def _query_hardware_vendors() -> dict[str, str]:
 
 
 @dataclass
+class DeviceIds:
+    """Identifiants d'un périphérique tels que Windows les utilise pour choisir son pilote."""
+    hardware_ids: tuple[str, ...] = ()
+    compatible_ids: tuple[str, ...] = ()
+    matching_id: str = ""      # identifiant qui a servi à choisir le pilote installé
+
+
+_ENUM_KEY = "SYSTEM\\CurrentControlSet\\Enum\\"
+_CLASS_KEY = "SYSTEM\\CurrentControlSet\\Control\\Class\\"
+
+
+def read_device_ids(instance_ids: list[str]) -> dict[str, DeviceIds]:
+    """Lit dans le registre (sans droits administrateur) les identifiants de chaque périphérique.
+
+    Clé du dictionnaire : identifiant d'instance en minuscules. Un périphérique illisible est ignoré.
+    """
+    try:
+        import winreg
+    except ImportError:  # hors Windows
+        return {}
+
+    def read(key, name):
+        try:
+            return winreg.QueryValueEx(key, name)[0]
+        except OSError:
+            return None
+
+    found: dict[str, DeviceIds] = {}
+    for instance in instance_ids:
+        if not instance or instance.lower() in found:
+            continue
+        try:
+            with winreg.OpenKey(winreg.HKEY_LOCAL_MACHINE, _ENUM_KEY + instance) as key:
+                hardware = read(key, "HardwareID") or []
+                compatible = read(key, "CompatibleIDs") or []
+                driver_key = read(key, "Driver") or ""
+        except OSError:
+            continue
+        matching = ""
+        if driver_key:
+            try:
+                with winreg.OpenKey(winreg.HKEY_LOCAL_MACHINE, _CLASS_KEY + driver_key) as key:
+                    matching = str(read(key, "MatchingDeviceId") or "")
+            except OSError:
+                pass
+        found[instance.lower()] = DeviceIds(tuple(str(h) for h in hardware if h),
+                                            tuple(str(c) for c in compatible if c), matching)
+    return found
+
+
+def driver_version_of(device_ids: list[str]) -> dict[str, tuple[str, datetime | None]]:
+    """Version et date du pilote actuellement utilisé par ces périphériques (après une installation)."""
+    wanted = {d.lower() for d in device_ids if d}
+    return {d.device_id.lower(): (d.version, d.date) for d in list_installed_drivers()
+            if d.device_id.lower() in wanted}
+
+
+@dataclass
 class VendorTool:
     vendor: str
     label: str
@@ -334,22 +392,44 @@ class WindowsUpdateDriverService:
     SEARCH_CRITERIA = "IsInstalled=0 and Type='Driver' and IsHidden=0"
 
     def __init__(self) -> None:
-        self._executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="windows-update",
-                                            initializer=_com_init)
+        self._generation = 0      # incrémenté quand une installation bloquée est abandonnée
+        self._executor = self._new_executor()
         self._session = None
         self._updates: dict[str, object] = {}  # objets COM, utilisés uniquement dans le thread dédié
         self.last_results: list[DriverUpdate] | None = None  # dernière recherche (lecture seule)
 
+    @staticmethod
+    def _new_executor() -> ThreadPoolExecutor:
+        return ThreadPoolExecutor(max_workers=1, thread_name_prefix="windows-update", initializer=_com_init)
+
     def shutdown(self) -> None:
         self._executor.shutdown(wait=False, cancel_futures=True)
+
+    def abandon(self) -> None:
+        """Abandonne une opération bloquée (ex. installation qui ne se termine jamais).
+
+        L'appel COM en cours ne peut pas être interrompu : on laisse l'ancien thread finir seul et les
+        opérations suivantes passent par un nouveau thread, avec une nouvelle session Windows Update.
+        """
+        self._generation += 1
+        old = self._executor
+        self._executor = self._new_executor()
+        self._session = None
+        self._updates = {}
+        old.shutdown(wait=False, cancel_futures=True)
+        log.warning("Windows Update : opération en cours abandonnée à la demande de l'utilisateur")
 
     # Les méthodes publiques renvoient des Future ; le travail s'exécute dans le thread dédié.
     def search(self) -> Future:
         return self._executor.submit(self._search)
 
     def install(self, update_ids: list[str],
-                progress: Callable[[int, int, str, str], None] | None = None) -> Future:
-        return self._executor.submit(self._install, list(update_ids), progress)
+                progress: Callable[[int, int, str, str], None] | None = None,
+                cancel=None, report: InstallReport | None = None) -> Future:
+        """`cancel` : évènement qui empêche d'installer les pilotes suivants ; `report` : bilan rempli au fur
+        et à mesure (lisible même si l'installation est abandonnée en cours de route)."""
+        return self._executor.submit(self._install, list(update_ids), progress, cancel,
+                                     report if report is not None else InstallReport(), self._generation)
 
     def _get_session(self):
         if self._session is None:
@@ -389,17 +469,20 @@ class WindowsUpdateDriverService:
         self.last_results = found
         return found
 
-    def _install(self, update_ids: list[str], progress) -> InstallReport:
+    def _install(self, update_ids: list[str], progress, cancel, report: InstallReport,
+                 generation: int) -> InstallReport:
         import win32com.client  # type: ignore
 
         if not self._updates:
             self._search()
         session = self._get_session()
-        report = InstallReport()
+        updates = self._updates
         total = len(update_ids)
 
         for index, update_id in enumerate(update_ids, start=1):
-            upd = self._updates.get(update_id)
+            if cancel is not None and cancel.is_set():
+                break
+            upd = updates.get(update_id)
             if upd is None:
                 report.outcomes.append(InstallOutcome(update_id, update_id, False,
                                                       "Mise à jour introuvable (relancez la recherche)."))
@@ -442,9 +525,11 @@ class WindowsUpdateDriverService:
                 log.exception("Installation du pilote %s impossible", title)
                 report.outcomes.append(InstallOutcome(update_id, title, False, com_error_message(exc)))
 
-        # Les pilotes installés ne doivent plus apparaître à la prochaine recherche.
-        self._updates.clear()
-        self.last_results = None
+        # Les pilotes installés ne doivent plus apparaître à la prochaine recherche (sauf si cette installation
+        # a été abandonnée entre-temps : l'état appartient alors au nouveau thread).
+        if generation == self._generation:
+            self._updates.clear()
+            self.last_results = None
         return report
 
 
@@ -474,6 +559,16 @@ try {{
 }}
 """
     return run_powershell(script, timeout=600)
+
+
+def install_inf_folder(folder: str, cancel=None) -> CommandResult:
+    """Ajoute les pilotes d'un dossier au magasin de Windows et les installe sur les périphériques concernés.
+
+    Windows applique ses propres règles : un pilote n'est installé sur un périphérique que s'il est meilleur
+    que le pilote actuel. Code 3010 : redémarrage nécessaire.
+    """
+    return run_cancellable(["pnputil.exe", "/add-driver", f"{folder}\\*.inf", "/subdirs", "/install"],
+                           timeout=1800, cancel=cancel)
 
 
 def rescan_hardware() -> CommandResult:

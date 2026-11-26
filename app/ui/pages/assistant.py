@@ -241,7 +241,7 @@ class AssistantPage(Page):
                             if d.status in (driver_analysis.PROBLEM, driver_analysis.GENERIC)
                             or (d.status == driver_analysis.VENDOR_UPDATE and not d.can_auto_install))
             unverified = report.count(driver_analysis.OLD, driver_analysis.UNVERIFIED)
-            verified = report.count(driver_analysis.VERIFIED)
+            verified = report.count(driver_analysis.VERIFIED, driver_analysis.OPTIONAL)
             self.results["drivers_auto"] = auto
             self.results["drivers_check"] = attention
             self.results["drivers_unverified"] = unverified
@@ -257,7 +257,7 @@ class AssistantPage(Page):
                     ("Voir les pilotes", lambda: self.app.show_page("drivers"), "neutral")])
             elif unverified:
                 card.set_state("done", f"{verified} pilote(s) vérifié(s) à jour. {unverified} ne peuvent pas être "
-                                       "vérifiés automatiquement (pas de service public chez leur fabricant) : "
+                                       "vérifiés automatiquement (absents des sources officielles consultées) : "
                                        "la page Pilotes donne le lien officiel de chacun.", actions=[
                     ("Voir les pilotes", lambda: self.app.show_page("drivers"), "neutral")])
             else:
