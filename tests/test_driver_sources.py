@@ -335,7 +335,7 @@ def test_unverified_by_default():
     wifi = report.devices[0]
     assert wifi.status == driver_analysis.UNVERIFIED            # jamais « à jour » sans source fiable
     assert wifi.checked_source == "" and wifi.checked_at is None
-    assert "Intel ne propose pas de service public" in wifi.no_api_note
+    assert "liste officielle d'Intel" in wifi.no_api_note             # Intel non consulté (hors ligne)
     # Pas de lien propre au modèle : la recherche par ID matériel (pré-remplie) passe avant la page générale.
     assert wifi.best_link.label.startswith("Catalogue Microsoft")
     assert wifi.links[1].label.startswith("Intel Driver & Support Assistant")

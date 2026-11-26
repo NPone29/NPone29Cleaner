@@ -4,8 +4,9 @@ On croise :
   1. les pilotes installés (WMI),
   2. les mises à jour proposées par Windows Update (installables automatiquement),
   3. les périphériques signalés en erreur,
-  4. les sources officielles (app/core/driver_sources) : NVIDIA, Dell, HP, Lenovo et le Catalogue
-     Microsoft Update (pilotes de tous les fabricants, classés selon les règles de Windows).
+  4. les sources officielles (app/core/driver_sources) : NVIDIA, Intel (liste de son outil officiel),
+     Dell, HP, Lenovo et le Catalogue Microsoft Update (pilotes de tous les fabricants, classés selon les
+     règles de Windows).
 Un pilote n'est affiché « à jour » que si une source fiable l'a vérifié. Sinon il est
 « non vérifiable » et l'application propose le lien officiel le plus précis.
 """
@@ -23,6 +24,7 @@ from app.core.driver_sources.base import newest
 from app.core.driver_sources.boards import pc_target
 from app.core.driver_sources.microsoft_catalog import CatalogDriver
 from app.core.drivers import DeviceIds, DriverUpdate, InstalledDriver, ProblemDevice
+from app.core.packages import VendorPackage
 from app.core.vendors import Vendor, parse_ids, vendor_for
 
 log = logging.getLogger(__name__)
@@ -83,6 +85,7 @@ class DeviceStatus:
     count: int = 1   # nombre de composants regroupés sur cette ligne
     catalog_driver: CatalogDriver | None = None    # pilote du Catalogue Microsoft installable automatiquement
     device_ids: list[str] = field(default_factory=list)   # tous les périphériques regroupés sur cette ligne
+    package: VendorPackage | None = None   # installateur officiel (NVIDIA, Intel) téléchargeable et vérifiable
 
     @property
     def status_label(self) -> str:
@@ -90,8 +93,7 @@ class DeviceStatus:
 
     @property
     def can_auto_install(self) -> bool:
-        return (bool(self.wu_update_ids) or bool(self.nvidia_driver and self.nvidia_driver.download_url)
-                or self.catalog_driver is not None)
+        return bool(self.wu_update_ids) or self.package is not None or self.catalog_driver is not None
 
     @property
     def best_link(self) -> DownloadLink | None:
@@ -172,15 +174,15 @@ def to_ref(d: InstalledDriver, ids: DeviceIds | None = None) -> DeviceRef:
 
 def _explain(status: str, vendor: Vendor, provider: str, version: str, latest: str, date: datetime | None,
              source: str = "", problem: str = "", basic_display: bool = False, nvidia_auto: bool = False,
-             note: str = "", catalog: CatalogDriver | None = None) -> str:
+             note: str = "", catalog: CatalogDriver | None = None, package: VendorPackage | None = None) -> str:
     text = _explain_status(status, vendor, provider, version, latest, date, source, problem, basic_display,
-                           nvidia_auto, catalog)
+                           nvidia_auto, catalog, package)
     return f"{text} {note}" if note and status in (VENDOR_UPDATE, VERIFIED, OPTIONAL) else text
 
 
 def _explain_status(status: str, vendor: Vendor, provider: str, version: str, latest: str, date: datetime | None,
                     source: str, problem: str, basic_display: bool, nvidia_auto: bool,
-                    catalog: CatalogDriver | None = None) -> str:
+                    catalog: CatalogDriver | None = None, package: VendorPackage | None = None) -> str:
     if status == PROBLEM:
         return (f"Windows signale un problème : « {problem} ». Installer ou réinstaller le bon pilote "
                 "règle souvent le souci.")
@@ -195,6 +197,9 @@ def _explain_status(status: str, vendor: Vendor, provider: str, version: str, la
             action = (f"Elle est prévue pour votre matériel et Windows la choisira à la place de l'actuelle. "
                       f"L'application peut la télécharger depuis Microsoft ({catalog.size_text}), vérifier son "
                       "empreinte et sa signature, puis l'installer.")
+        elif package is not None:
+            action = (f"L'application peut la télécharger depuis {package.host} ({package.size_text}), vérifier son "
+                      f"empreinte et sa signature {package.publisher}, puis lancer l'installateur officiel.")
         else:
             action = "Cliquez sur « Télécharger » : le fichier ou la page officielle s'ouvre dans votre navigateur."
         return f"{source} propose la version {latest} (vous avez la {version}). {action}"
@@ -270,6 +275,9 @@ def analyse(
             best = next((c for c in newer if c.latest_version == top), newer[0])
         nv = best.extra if best and isinstance(best.extra, nvidia.NvidiaDriver) else None
         catalog = best.extra if best and isinstance(best.extra, CatalogDriver) else None
+        package = best.extra if best and isinstance(best.extra, VendorPackage) else None
+        if package is None and nv and nv.download_url:
+            package = nv.package()
         is_nvidia_gpu = vendor.name == "NVIDIA" and cls == "DISPLAY"
         version_text = nvidia.windows_to_nvidia_version(d.version) if is_nvidia_gpu else d.version
 
@@ -349,7 +357,8 @@ def analyse(
                                  problem.error_text if problem else "",
                                  basic_display="basic display" in d.device_name.lower(),
                                  nvidia_auto=bool(nv and nv.download_url), note=check_note,
-                                 catalog=catalog if status == VENDOR_UPDATE else None),
+                                 catalog=catalog if status == VENDOR_UPDATE else None,
+                                 package=package if status == VENDOR_UPDATE else None),
             latest_version=matched[0].title if matched else latest,
             wu_update_ids=[u.update_id for u in matched],
             nvidia_driver=nv,
@@ -360,6 +369,7 @@ def analyse(
             no_api_note=note,
             catalog_driver=catalog if status == VENDOR_UPDATE else None,
             device_ids=[d.device_id],
+            package=package,
         )
         if grouped:
             groups[group_key] = row

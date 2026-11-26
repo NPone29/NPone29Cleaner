@@ -1,7 +1,8 @@
-"""Fabricants de puces sans service public de vérification : Intel, AMD et tous les autres.
+"""Fabricants de puces sans service public de vérification : AMD et tous les autres.
 
 Ces sources ne vérifient rien (``has_public_api = False``) : elles donnent les pages officielles
 et l'interface explique pourquoi la version ne peut pas être vérifiée automatiquement.
+(Intel, lui, est vérifié avec la liste publique de son outil officiel : voir intel_dsa.py.)
 """
 
 from __future__ import annotations
@@ -15,23 +16,6 @@ from app.utils.download import is_allowed_url
 
 def device_vendor(dev: DeviceRef) -> Vendor:
     return vendor_for(dev.device_id, dev.vendor_name)
-
-
-class IntelSource(DriverSource):
-    name = "Intel"
-    allowed_hosts = (".intel.com", ".intel.fr")
-    no_api_note = ("Intel ne propose pas de service public pour vérifier les versions : son outil officiel "
-                   "Intel Driver & Support Assistant détecte le pilote exact.")
-
-    def applies_to_device(self, dev: DeviceRef) -> bool:
-        return device_vendor(dev).name == INTEL.name
-
-    def links(self, ctx: SystemContext, dev: DeviceRef, checks) -> list[DownloadLink]:
-        if not self.applies_to_device(dev):
-            return []
-        out = [DownloadLink("Intel Driver & Support Assistant (outil officiel)", INTEL.support_url, GENERAL),
-               DownloadLink("Rechercher sur intel.com", web_search_url(dev.name, INTEL), SEARCH)]
-        return [link for link in out if self.safe(link)]
 
 
 class AmdSource(DriverSource):

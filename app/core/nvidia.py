@@ -53,6 +53,17 @@ class NvidiaDriver:
     size_text: str
     name: str
 
+    def package(self):
+        """L'installateur, vu comme un paquet officiel téléchargeable et vérifiable (app/core/packages.py)."""
+        from app.core.packages import VendorPackage
+
+        return VendorPackage(
+            vendor="NVIDIA", title=f"Carte graphique NVIDIA {self.version}", version=self.version,
+            download_url=self.download_url, allowed_hosts=ALLOWED_DOWNLOAD_HOSTS, publisher="NVIDIA Corporation",
+            size_label=self.size_text, page_url=self.details_url,
+            advice="Installateur NVIDIA : choisissez « Installation express ». L'écran peut clignoter quelques "
+                   "secondes.")
+
 
 def _num(text: str) -> float | None:
     try:

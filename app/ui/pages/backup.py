@@ -12,9 +12,10 @@ from tkinter import filedialog
 import customtkinter as ctk
 import psutil
 
-from app.core import backup
+from app.core import backup, backup_schedule
 from app.core.backup import (DIFFERENTIAL, FOLDER, FULL, INCREMENTAL, KIND_LABELS, ORIGINAL, BackupPlan,
                              BackupResult, BackupSet, DestinationCheck, Progress, RestoreResult, VerifyResult)
+from app.core.backup_schedule import FREQUENCIES, FULL_EVERY, BackupLock, TaskInfo
 from app.ui import theme
 from app.ui.pages.base import Page
 from app.ui.widgets import (LEVEL_COLORS, Card, PageHeader, ResultDialog, StatusLine, Table, TipBox, ask_yes_no,
@@ -96,6 +97,11 @@ class BackupPage(Page):
         self.dest_check: DestinationCheck | None = None
         self._check_after: str | None = None
         self._sizes_started = False
+        self._lock = BackupLock()      # partagé avec la sauvegarde automatique : jamais deux à la fois
+        # Sauvegarde automatique
+        self._task: TaskInfo | None = None
+        self._task_checked = False
+        self._auto_busy = False
         # Restauration
         self.repo: Path | None = None
         self.sets: list[BackupSet] = []
@@ -143,6 +149,8 @@ class BackupPage(Page):
             self._compute_sizes()
         self._refresh_drives()
         self._schedule_check()
+        self._refresh_last_backup()
+        self._refresh_auto(query=True)
 
     def _set_busy(self, busy: bool) -> None:
         self.busy = busy
@@ -241,8 +249,10 @@ class BackupPage(Page):
             .pack(side="left")
         self._mode_changed(save=False)
 
+        self._build_auto_card(tab).grid(row=4, column=0, sticky="ew", pady=(0, 10))
+
         actions = ctk.CTkFrame(tab, fg_color="transparent")
-        actions.grid(row=4, column=0, sticky="ew", pady=(4, 6))
+        actions.grid(row=5, column=0, sticky="ew", pady=(4, 6))
         self.start_btn = primary_button(actions, "Lancer la sauvegarde", self.start_backup, width=200)
         self.start_btn.pack(side="left")
         ctk.CTkLabel(actions, text="Rien n'est copié avant votre confirmation.", font=theme.font(12),
@@ -426,6 +436,7 @@ class BackupPage(Page):
             self.dest_label.configure(text=f"{symbol}  {check.summary}",
                                       text_color=LEVEL_COLORS.get(check.level, theme.MUTED))
             self.dest_warn.configure(text="\n".join(check.warnings))
+            self._render_auto()
 
         self.dispatcher.run(backup.check_destination, dest, sources, on_done=done)
 
@@ -445,18 +456,277 @@ class BackupPage(Page):
         self.settings.set("backup_keep_full", KEEP_CHOICES.get(self.keep.get(), 0))
 
     def _refresh_last_backup(self) -> None:
-        last = self.settings.get("backup_last") or {}
+        last = backup_schedule.last_backup(self.settings.get("backup_last") or {}, backup_schedule.load_status())
         when = backup.parse_time(last.get("finished"))
         if when:
             kind = KIND_LABELS.get(last.get("kind", ""), "").lower()
-            text = (f"Dernière sauvegarde : {when:%d/%m/%Y à %H:%M} ({_ago(when)}), {kind}, sur "
+            auto = " automatique" if last.get("auto") else ""
+            text = (f"Dernière sauvegarde{auto} : {when:%d/%m/%Y à %H:%M} ({_ago(when)}), {kind}, sur "
                     f"{last.get('destination', '?')}.")
             if (datetime.now() - when).days >= 7:
-                text += " Pensez à en refaire une : au moins une fois par semaine est conseillé."
+                text += " Pensez à en refaire une : au moins une fois par semaine est conseillé"
+                text += "." if self.settings.get("backup_auto", False) else \
+                    " (ou activez la sauvegarde automatique, étape 4)."
             self.last_tip.set_text(text)
         else:
             self.last_tip.set_text("Aucune sauvegarde pour l'instant. Branchez un disque externe, choisissez vos "
                                    "dossiers, puis lancez une première sauvegarde (elle sera complète).")
+
+    # ---------------------------------------------------------------- sauvegarde automatique
+    def _build_auto_card(self, tab) -> Card:
+        card = Card(tab)
+        card.grid_columnconfigure(0, weight=1)
+        head = ctk.CTkFrame(card, fg_color="transparent")
+        head.grid(row=0, column=0, sticky="ew", padx=16, pady=(14, 2))
+        ctk.CTkLabel(head, text="4.  Sauvegarde automatique", font=theme.font(15, "bold"), anchor="w") \
+            .pack(side="left")
+        self.auto_var = ctk.BooleanVar(value=bool(self.settings.get("backup_auto", False)))
+        self.auto_switch = ctk.CTkSwitch(head, text="Activer", variable=self.auto_var, font=theme.font(13, "bold"),
+                                         command=self._toggle_auto)
+        self.auto_switch.pack(side="right")
+        ctk.CTkLabel(card, text="L'application sauvegarde vos dossiers toute seule, en arrière-plan, même quand elle "
+                                "est fermée, avec les dossiers et la destination choisis ci-dessus. Si le PC est "
+                                "éteint ou le disque débranché à l'heure prévue, la sauvegarde se fait dès que "
+                                "possible (vérification toutes les heures).",
+                     font=theme.font(12), text_color=theme.MUTED, anchor="w", justify="left", wraplength=760) \
+            .grid(row=1, column=0, sticky="w", padx=16, pady=(0, 8))
+
+        opts = ctk.CTkFrame(card, fg_color="transparent")
+        opts.grid(row=2, column=0, sticky="w", padx=16, pady=(0, 6))
+        ctk.CTkLabel(opts, text="Fréquence :", font=theme.font(12)).pack(side="left")
+        self.auto_freq = ctk.CTkOptionMenu(opts, values=list(FREQUENCIES), width=180, height=30,
+                                           command=lambda _v: self._save_auto_prefs())
+        hours = int(self.settings.get("backup_auto_hours", backup_schedule.DEFAULT_HOURS) or 24)
+        self.auto_freq.set(backup_schedule.frequency_label(hours))
+        self.auto_freq.pack(side="left", padx=(8, 20))
+        ctk.CTkLabel(opts, text="Type :", font=theme.font(12)).pack(side="left")
+        self.auto_mode = ctk.CTkSegmentedButton(opts, values=[KIND_LABELS[m] for m in MODES], font=theme.font(12),
+                                                height=30, command=lambda _v: self._save_auto_prefs())
+        self.auto_mode.set(KIND_LABELS.get(self.settings.get("backup_auto_mode", INCREMENTAL),
+                                           KIND_LABELS[INCREMENTAL]))
+        self.auto_mode.pack(side="left", padx=8)
+
+        full_line = ctk.CTkFrame(card, fg_color="transparent")
+        full_line.grid(row=3, column=0, sticky="w", padx=16, pady=(0, 4))
+        ctk.CTkLabel(full_line, text="Faire aussi une sauvegarde complète :", font=theme.font(12)).pack(side="left")
+        self.auto_full = ctk.CTkOptionMenu(full_line, values=list(FULL_EVERY), width=190, height=30,
+                                           command=lambda _v: self._save_auto_prefs())
+        weeks = int(self.settings.get("backup_auto_full_weeks", 0) or 0)
+        self.auto_full.set(next((k for k, v in FULL_EVERY.items() if v == weeks), "Jamais"))
+        self.auto_full.pack(side="left", padx=8)
+        ctk.CTkLabel(card, text="Une complète régulière repart d'une base neuve ; les plus anciennes sont supprimées "
+                                "selon « Sauvegardes complètes à conserver » (étape 3).",
+                     font=theme.font(11), text_color=theme.MUTED, anchor="w", justify="left", wraplength=760) \
+            .grid(row=4, column=0, sticky="w", padx=16, pady=(0, 2))
+
+        self.auto_state = ctk.CTkLabel(card, text="", font=theme.font(12, "bold"), anchor="w", justify="left",
+                                       wraplength=760)
+        self.auto_state.grid(row=5, column=0, sticky="w", padx=16, pady=(6, 0))
+        self.auto_detail = ctk.CTkLabel(card, text="", font=theme.font(12), text_color=theme.MUTED, anchor="w",
+                                        justify="left", wraplength=760)
+        self.auto_detail.grid(row=6, column=0, sticky="w", padx=16, pady=(0, 4))
+        self.auto_actions = ctk.CTkFrame(card, fg_color="transparent", height=4)
+        self.auto_actions.grid(row=7, column=0, sticky="w", padx=16, pady=(0, 12))
+        self.auto_repair_btn = neutral_button(self.auto_actions, "Réparer la tâche planifiée", self._repair_auto,
+                                              width=10)
+        self.auto_admin_btn = neutral_button(self.auto_actions, "Relancer en administrateur",
+                                             self.app.restart_as_admin, width=10)
+        self._update_full_state()
+        self._render_auto()
+        return card
+
+    def _auto_mode(self) -> str:
+        label = self.auto_mode.get()
+        return next((m for m in MODES if KIND_LABELS[m] == label), INCREMENTAL)
+
+    def _update_full_state(self) -> None:
+        state = "disabled" if self._auto_mode() == FULL else "normal"
+        self.auto_full.configure(state=state)
+
+    def _save_auto_prefs(self) -> None:
+        """La tâche relit les réglages à chaque exécution : rien à recréer quand ils changent."""
+        self.settings.set("backup_auto_hours", FREQUENCIES.get(self.auto_freq.get(), 24), save=False)
+        self.settings.set("backup_auto_mode", self._auto_mode(), save=False)
+        self.settings.set("backup_auto_full_weeks", FULL_EVERY.get(self.auto_full.get(), 0))
+        self._update_full_state()
+        self._render_auto()
+
+    def _toggle_auto(self) -> None:
+        enable = bool(self.auto_var.get())
+        if self._auto_busy:
+            self.auto_var.set(not enable)
+            return
+        if not enable:
+            self.settings.set("backup_auto", False)
+            self._run_task_op(enable=False)
+            return
+        self.auto_var.set(False)       # cochée seulement une fois la tâche créée
+        if not self.is_admin:
+            if ask_yes_no(self, "Droits administrateur requis",
+                          "Pour planifier la sauvegarde automatique, l'application doit être lancée en "
+                          "administrateur (une seule fois : la sauvegarde se fera ensuite toute seule, sans rien "
+                          "vous demander).\n\nRelancer l'application en administrateur ?"):
+                self.app.restart_as_admin()
+            return
+        if not self._selected_sources():
+            show_warning(self, "Aucun dossier", "Cochez d'abord au moins un dossier à sauvegarder (étape 1).")
+            return
+        dest = self.destination.get().strip()
+        if not dest:
+            show_warning(self, "Destination", "Choisissez d'abord où enregistrer la sauvegarde (étape 2).")
+            return
+        unc = backup_schedule.network_drive_target(dest)
+        if unc and ask_yes_no(self, "Lecteur réseau",
+                              f"{dest} est une lettre de lecteur réseau. La sauvegarde automatique ne voit pas ces "
+                              "lettres (elles n'existent que dans votre session) : il vaut mieux utiliser le chemin "
+                              f"réseau complet :\n\n{unc}\n\nUtiliser ce chemin ?"):
+            self.destination.set(unc)
+        if self.dest_check is not None and self.dest_check.same_disk and not ask_yes_no(
+                self, "Même disque",
+                self.dest_check.warnings[0] + "\n\nActiver quand même la sauvegarde automatique (protège seulement "
+                                              "contre une suppression accidentelle) ?"):
+            return
+        self._save_prefs()
+        self.settings.set("backup_destination", self.destination.get().strip(), save=False)
+        self._save_auto_prefs()
+        self._run_task_op(enable=True)
+
+    def _repair_auto(self) -> None:
+        if not self.is_admin:
+            self.app.restart_as_admin()
+            return
+        self._run_task_op(enable=True)
+
+    def _run_task_op(self, enable: bool) -> None:
+        self._auto_busy = True
+        self.auto_switch.configure(state="disabled")
+        self.auto_state.configure(text="Création de la tâche planifiée…" if enable
+                                  else "Arrêt de la sauvegarde automatique…", text_color=theme.MUTED)
+
+        def work():
+            if enable:
+                result = backup_schedule.create_task()
+            elif self._task is not None or not self._task_checked:
+                result = backup_schedule.delete_task()
+            else:
+                result = None
+            return result, backup_schedule.query_task()
+
+        def done(out) -> None:
+            result, task = out
+            self._task, self._task_checked = task, True
+            if enable:
+                if result is not None and result.ok and task is not None:
+                    self.settings.set("backup_auto", True)
+                    self.app.notify("Sauvegarde automatique activée",
+                                    f"{self.auto_freq.get()} — première vérification dans quelques minutes.",
+                                    "success")
+                else:
+                    self.settings.set("backup_auto", False)
+                    detail = (result.output if result is not None else "") or "erreur inconnue"
+                    show_error(self, "Sauvegarde automatique",
+                               f"La tâche planifiée n'a pas pu être créée.\n\nDétail : {detail[:500]}")
+            self._render_auto()
+
+        def error(exc: BaseException) -> None:
+            if enable:
+                self.settings.set("backup_auto", False)
+            show_error(self, "Sauvegarde automatique", f"Opération impossible : {exc}")
+            self._render_auto()
+
+        def finished() -> None:
+            self._auto_busy = False
+            self.auto_switch.configure(state="normal")
+            self._render_auto()
+
+        self.dispatcher.run(work, on_done=done, on_error=error, on_finally=finished)
+
+    def _refresh_auto(self, query: bool = False) -> None:
+        if query and not self._auto_busy:
+            def done(task: TaskInfo | None) -> None:
+                self._task, self._task_checked = task, True
+                self._render_auto()
+
+            self.dispatcher.run(backup_schedule.query_task, on_done=done, on_error=lambda _e: None)
+        self._render_auto()
+
+    def _render_auto(self) -> None:
+        if self._auto_busy:
+            return
+        enabled = bool(self.settings.get("backup_auto", False))
+        self.auto_var.set(enabled)
+        for btn in (self.auto_repair_btn, self.auto_admin_btn):
+            btn.pack_forget()
+        now = datetime.now()
+        if not enabled:
+            self.auto_state.configure(text="Désactivée.", text_color=theme.MUTED)
+            detail = ("Activez-la pour ne plus avoir à y penser : idéal si le disque de sauvegarde reste branché ou "
+                      "si vous le branchez régulièrement.")
+            if not self.is_admin:
+                detail += " Il faut lancer l'application en administrateur pour l'activer."
+                self.auto_admin_btn.pack(side="left")
+            if self._task is not None:
+                detail += (" La tâche planifiée est encore inscrite dans Windows, mais elle ne fait plus rien "
+                           "(relancez l'application en administrateur pour la retirer).")
+            self.auto_detail.configure(text=detail)
+            return
+
+        cfg = backup_schedule.AutoConfig.from_settings(self.settings)
+        status = backup_schedule.load_status()
+        command, arguments, _wd = backup_schedule.task_command()
+        repair = False
+        fix = ("cliquez sur « Réparer »." if self.is_admin
+               else "relancez l'application en administrateur pour la réparer.")
+        if self._task_checked and self._task is None:
+            state, color, repair = (f"⚠ Activée, mais la tâche planifiée est introuvable dans Windows : {fix}",
+                                    theme.WARNING, True)
+        elif self._task is not None and not self._task.matches(command, arguments):
+            state, color, repair = ("⚠ Activée, mais la tâche planifiée lance une autre copie de l'application "
+                                    f"(déplacée ?) : {fix}", theme.WARNING, True)
+        else:
+            state = (f"✓ Activée — {backup_schedule.frequency_label(cfg.hours).lower()}, "
+                     f"sauvegarde {KIND_LABELS[cfg.mode].lower()}")
+            if cfg.full_weeks and cfg.mode != FULL:
+                full = next((k for k, v in FULL_EVERY.items() if v == cfg.full_weeks), "")
+                state += f", et une complète {full.lower()}"
+            state, color = state + ".", theme.SUCCESS
+        if repair:
+            (self.auto_repair_btn if self.is_admin else self.auto_admin_btn).pack(side="left")
+
+        lines = []
+        last = backup.parse_time(status.get("last_success"))
+        if last:
+            line = (f"Dernière sauvegarde automatique : {last:%d/%m/%Y à %H:%M} ({_ago(last)}), "
+                    f"{KIND_LABELS.get(status.get('last_kind', ''), '').lower()}, "
+                    f"{_count(int(status.get('copied', 0) or 0))} fichier(s) copié(s)")
+            errors = int(status.get("errors", 0) or 0)
+            lines.append(line + (f", {_count(errors)} non copié(s)." if errors else "."))
+        else:
+            lines.append("Aucune sauvegarde automatique pour l'instant.")
+        present = bool(cfg.destination) and os.path.isdir(cfg.destination)
+        missing = backup.parse_time(status.get("disk_missing_since"))
+        if status.get("result") == backup_schedule.ERROR and status.get("message"):
+            attempt = backup.parse_time(status.get("last_attempt"))
+            when = f" le {attempt:%d/%m à %H:%M}" if attempt else ""
+            lines.append(f"✕ Échec{when} : {status['message']}")
+            if not repair:
+                color = theme.DANGER
+        if missing and not present:
+            lines.append(f"⚠ Disque de sauvegarde absent depuis {backup_schedule.days_text(now - missing)}.")
+            if not repair and color == theme.SUCCESS:
+                color = theme.WARNING
+        start = backup.parse_time(status.get("last_success_started"))
+        if not present:
+            lines.append(f"Prochaine : dès que {cfg.destination or 'la destination'} sera disponible "
+                         "(disque branché).")
+        elif backup_schedule.is_due(start, cfg.hours, now):
+            lines.append("Prochaine : dans moins d'une heure.")
+        else:
+            due = backup_schedule.next_due(start, cfg.hours)
+            day = "" if due.date() == now.date() else f"le {due:%d/%m} "
+            lines.append(f"Prochaine : {day}vers {due:%H:%M}.")
+        self.auto_state.configure(text=state, text_color=color)
+        self.auto_detail.configure(text="\n".join(lines))
 
     # ---------------------------------------------------------------- lancement
     def start_backup(self) -> None:
@@ -476,6 +746,10 @@ class BackupPage(Page):
                 check.warnings[0] + "\n\nContinuer quand même (protège seulement contre une suppression "
                                     "accidentelle) ?"):
             return
+        if not self._lock.acquire():
+            show_info(self, "Sauvegarde en cours",
+                      "Une sauvegarde automatique est en cours en arrière-plan.\n\nRéessayez dans quelques minutes.")
+            return
         self._save_prefs()
         self.cancel.clear()
         self._set_busy(True)
@@ -488,6 +762,7 @@ class BackupPage(Page):
     def _after_plan(self) -> None:
         # Le bouton reste bloqué si la copie a démarré (elle gère elle-même la fin).
         if not self._copying:
+            self._lock.release()
             self._set_busy(False)
 
     def _confirm_backup(self, plan: BackupPlan, check: DestinationCheck) -> None:
@@ -532,6 +807,7 @@ class BackupPage(Page):
 
     def _after_copy(self) -> None:
         self._copying = False
+        self._lock.release()
         self._set_busy(False)
 
     def _backup_error(self, exc: BaseException) -> None:

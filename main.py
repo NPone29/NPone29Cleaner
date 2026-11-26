@@ -42,6 +42,14 @@ def main() -> int:
     log = logging.getLogger("main")
     log.info("Démarrage de %s %s", APP_NAME, APP_VERSION)
 
+    if "--backup" in sys.argv:
+        # Sauvegarde automatique (tâche planifiée) : aucune fenêtre. --force : sauvegarde même si non due.
+        from app.core.backup_schedule import run_scheduled
+
+        outcome = run_scheduled(force="--force" in sys.argv)
+        log.info("Sauvegarde automatique : %s %s", outcome.action, outcome.message)
+        return outcome.code
+
     _enable_dpi_awareness()
     _set_app_user_model_id()
 

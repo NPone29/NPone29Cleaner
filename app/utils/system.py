@@ -98,45 +98,66 @@ def kill_process_tree(pid: int) -> None:
 
 
 def run_cancellable(args: list[str], timeout: float | None = None, cancel=None,
-                    poll: float = 0.3) -> CommandResult:
+                    poll: float = 0.3, on_tick=None, tick: float = 1.0) -> CommandResult:
     """Comme `run_command`, mais interruptible à tout moment via l'évènement `cancel`.
 
     La sortie passe par des fichiers temporaires et non par des tubes : un programme lancé par la commande
     (ex. l'installateur d'un logiciel) qui resterait ouvert ne peut donc pas bloquer la lecture. En cas
     d'annulation ou de délai dépassé, toute l'arborescence de processus est terminée.
+
+    `on_tick(pid, sortie)` est appelé environ toutes les `tick` secondes pendant l'exécution, avec la sortie
+    standard reçue jusque-là (suivi en direct). Une erreur dans `on_tick` n'interrompt jamais la commande.
     """
     import tempfile
     import time
 
     log.debug("run_cancellable: %s", args)
     deadline = time.monotonic() + timeout if timeout else None
-    with tempfile.TemporaryFile() as out, tempfile.TemporaryFile() as err:
-        try:
-            proc = subprocess.Popen(args, stdout=out, stderr=err, stdin=subprocess.DEVNULL,
-                                    creationflags=CREATE_NO_WINDOW)
-        except FileNotFoundError as exc:
-            return CommandResult(-1, "", f"Programme introuvable : {exc}")
-        stopped = None
-        while True:
+    # Fichier nommé : relu par un second descripteur pendant que la commande écrit, sans déplacer sa
+    # position d'écriture (un descripteur hérité partage sa position avec le processus enfant).
+    fd, out_path = tempfile.mkstemp(prefix="npone29_", suffix=".out")
+    try:
+        with os.fdopen(fd, "wb") as out, open(out_path, "rb") as reader, tempfile.TemporaryFile() as err:
             try:
-                proc.wait(timeout=poll)
-                break
-            except subprocess.TimeoutExpired:
-                pass
-            if cancel is not None and cancel.is_set():
-                stopped = (RC_CANCELLED, "Interrompu par l'utilisateur.")
-            elif deadline is not None and time.monotonic() > deadline:
-                stopped = (RC_TIMEOUT, "Délai d'attente dépassé.")
-            if stopped:
-                kill_process_tree(proc.pid)
+                proc = subprocess.Popen(args, stdout=out, stderr=err, stdin=subprocess.DEVNULL,
+                                        creationflags=CREATE_NO_WINDOW)
+            except FileNotFoundError as exc:
+                return CommandResult(-1, "", f"Programme introuvable : {exc}")
+            received = bytearray()
+            next_tick = time.monotonic() + tick
+            stopped = None
+            while True:
                 try:
-                    proc.wait(timeout=10)
+                    proc.wait(timeout=poll)
+                    break
                 except subprocess.TimeoutExpired:
-                    proc.kill()
-                break
-        out.seek(0)
-        err.seek(0)
-        stdout, stderr = decode_output(out.read()), decode_output(err.read())
+                    pass
+                if cancel is not None and cancel.is_set():
+                    stopped = (RC_CANCELLED, "Interrompu par l'utilisateur.")
+                elif deadline is not None and time.monotonic() > deadline:
+                    stopped = (RC_TIMEOUT, "Délai d'attente dépassé.")
+                if stopped:
+                    kill_process_tree(proc.pid)
+                    try:
+                        proc.wait(timeout=10)
+                    except subprocess.TimeoutExpired:
+                        proc.kill()
+                    break
+                if on_tick is not None and time.monotonic() >= next_tick:
+                    next_tick = time.monotonic() + tick
+                    received += reader.read()
+                    try:
+                        on_tick(proc.pid, decode_output(bytes(received)))
+                    except Exception:
+                        log.warning("Suivi en direct impossible", exc_info=True)
+            received += reader.read()
+            err.seek(0)
+            stdout, stderr = decode_output(bytes(received)), decode_output(err.read())
+    finally:
+        try:
+            os.remove(out_path)
+        except OSError:      # encore ouvert par un programme resté en arrière-plan : supprimé plus tard
+            log.debug("Fichier temporaire conservé : %s", out_path)
     if stopped:
         return CommandResult(stopped[0], stdout, (stderr + "\n" + stopped[1]).strip())
     return CommandResult(proc.returncode, stdout, stderr)
