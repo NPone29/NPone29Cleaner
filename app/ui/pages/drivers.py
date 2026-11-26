@@ -2,14 +2,17 @@
 
 from __future__ import annotations
 
-import os
+import logging
 import threading
+from concurrent.futures import TimeoutError as FutureTimeout
 
 import customtkinter as ctk
 
 from app.core import driver_analysis, drivers, nvidia
 from app.core.driver_analysis import AnalysisReport, DeviceStatus
-from app.core.drivers import DriverUpdate, InstallReport
+from app.core.driver_sources import microsoft_catalog
+from app.core.driver_sources.microsoft_catalog import CatalogDriver
+from app.core.drivers import DriverUpdate, InstallOutcome, InstallReport
 from app.core.maintenance import open_device_manager
 from app.ui import theme
 from app.ui.pages.base import Page
@@ -18,14 +21,21 @@ from app.ui.widgets import (Card, PageHeader, ResultDialog, StatusLine, Stepper,
 from app.utils.download import DownloadCancelled, download_file, verify_signature
 from app.utils.fmt import format_date, human_size
 from app.utils.system import open_url, run_command
+from app.utils.winapi import launch_and_wait
+
+log = logging.getLogger(__name__)
 
 TABS = ["Analyse complète", "Windows Update", "Pilotes installés", "Périphériques en erreur"]
 STEPS = ["Analyser", "Vérifier", "Mettre à jour", "Terminé"]
 STATUS_TAGS = {
     driver_analysis.PROBLEM: ("error",), driver_analysis.UPDATE: ("warn",),
     driver_analysis.VENDOR_UPDATE: ("warn",), driver_analysis.GENERIC: ("warn",),
+    driver_analysis.OPTIONAL: ("info",),
     driver_analysis.OLD: ("muted",), driver_analysis.UNVERIFIED: ("muted",), driver_analysis.VERIFIED: ("ok",),
 }
+# Un pilote du catalogue à installer, les périphériques qu'il concerne (pour vérifier le résultat) et le nom
+# affiché (celui de la ligne : le « modèle » du catalogue liste parfois toutes les cartes prises en charge).
+CatalogJob = tuple[CatalogDriver, list[str], str]
 UNVERIFIABLE = (driver_analysis.OLD, driver_analysis.UNVERIFIED)
 
 
@@ -39,10 +49,11 @@ class DriversPage(Page):
         self.report: AnalysisReport | None = None
         self.devices: dict[str, DeviceStatus] = {}
         self.busy = False
-        self.cancel = threading.Event()
+        self.cancel = threading.Event()                   # tout arrêter
+        self._current_skip: threading.Event | None = None  # passer le pilote en cours d'installation
         self._loaded_installed = False
         self._loaded_problems = False
-        self._after_install = None
+        self._pending_refresh = False    # actualiser dès que l'opération en cours se termine
 
         self.grid_columnconfigure(0, weight=1)
         self.grid_rowconfigure(2, weight=1)
@@ -64,6 +75,15 @@ class DriversPage(Page):
         }
         self.status = StatusLine(self)
         self.status.grid(row=3, column=0, sticky="ew", pady=(10, 0))
+
+        # Affichés pendant une installation : un pilote bloqué ne doit jamais bloquer les suivants.
+        self.install_controls = ctk.CTkFrame(self, fg_color="transparent")
+        self.skip_btn = neutral_button(self.install_controls, "Passer ce pilote", self._skip_current, width=10)
+        self.skip_btn.pack(side="left")
+        self.stop_btn = neutral_button(self.install_controls, "Tout arrêter", self._stop_all, width=10)
+        self.stop_btn.pack(side="left", padx=8)
+        ctk.CTkLabel(self.install_controls, text="Installation bloquée ? Passez au pilote suivant ou arrêtez tout.",
+                     font=theme.font(12), text_color=theme.MUTED).pack(side="left", padx=4)
         self.tabs.set(TABS[0])
         self._switch_tab(TABS[0])
         self.status.set_text("Cliquez sur « Analyser tous les pilotes » pour commencer.")
@@ -89,6 +109,44 @@ class DriversPage(Page):
         for btn in (self.analyse_btn, self.update_all_btn, self.search_btn, self.install_btn):
             btn.configure(state=state)
         self._render_detail()
+        if not busy:
+            self._show_install_controls(False)
+        if not busy and self._pending_refresh:
+            self.after(200, self._refresh_after_install)
+
+    # ------------------------------------------------------------------ interruption d'une installation
+    def _show_install_controls(self, show: bool) -> None:
+        if show:
+            self.skip_btn.configure(state="normal")
+            self.stop_btn.configure(state="normal")
+            self.install_controls.grid(row=4, column=0, sticky="w", pady=(8, 0))
+        else:
+            self._current_skip = None
+            self.install_controls.grid_remove()
+
+    def _skip_current(self) -> None:
+        current = self._current_skip
+        if current is None or current.is_set():
+            return
+        if not ask_yes_no(self, "Passer ce pilote",
+                          "Interrompre l'installation du pilote en cours et passer au suivant ?\n\n"
+                          "À utiliser si l'installation semble bloquée. Windows conserve alors le pilote "
+                          "actuel ; redémarrez le PC si le périphérique ne fonctionne plus correctement."):
+            return
+        if self._current_skip is current:
+            current.set()
+            self.status.set_text("Interruption du pilote en cours…")
+
+    def _stop_all(self) -> None:
+        if not ask_yes_no(self, "Tout arrêter",
+                          "Interrompre le pilote en cours et ne pas installer les suivants ?"):
+            return
+        self.cancel.set()
+        if self._current_skip is not None:
+            self._current_skip.set()
+        self.skip_btn.configure(state="disabled")
+        self.stop_btn.configure(state="disabled")
+        self.status.set_text("Arrêt de l'installation…")
 
     # ================================================================== ANALYSE COMPLÈTE
     def _build_analysis_tab(self) -> ctk.CTkFrame:
@@ -112,11 +170,11 @@ class DriversPage(Page):
         self.summary_label = ctk.CTkLabel(bar, text="", font=theme.font(13, "bold"))
         self.summary_label.pack(side="right")
 
-        TipBox(frame, "Chaque pilote est comparé à Windows Update et aux sources officielles : nvidia.com pour les "
-                      "cartes NVIDIA, et le catalogue du fabricant pour les PC Dell, HP et Lenovo. Un pilote n'est "
-                      "marqué « À jour (vérifié) » que si l'une de ces sources l'a confirmé. Les autres fabricants "
-                      "(Intel, AMD, Realtek, ASUS, MSI…) ne proposent pas de service public de vérification : ces "
-                      "pilotes sont « Non vérifiables » et le bouton « Télécharger » ouvre leur page officielle.") \
+        TipBox(frame, "Chaque pilote est comparé à Windows Update, au Catalogue Microsoft Update (pilotes Intel, "
+                      "Realtek, Killer… publiés pour l'identifiant exact de votre matériel), à nvidia.com et au "
+                      "catalogue des PC Dell, HP et Lenovo. Seules les versions que Windows choisirait lui-même "
+                      "sont proposées. Un pilote n'est marqué « À jour (vérifié) » que si l'une de ces sources l'a "
+                      "confirmé. La liste s'actualise toute seule après chaque installation.") \
             .grid(row=2, column=0, sticky="ew", pady=(0, 8))
 
         self.analysis_table = Table(frame, [
@@ -147,10 +205,11 @@ class DriversPage(Page):
         scaling = ctk.ScalingTracker.get_widget_scaling(self.detail)
         self.detail_text.configure(wraplength=max(300, int(event.width / scaling) - 40))
 
-    def start_analysis(self, reuse: bool = False) -> None:
+    def start_analysis(self, reuse: bool = False, switch: bool = True) -> None:
         if self.busy:
             return
-        self._switch_tab(TABS[0])
+        if switch:
+            self._switch_tab(TABS[0])
         self._set_busy(True)
         self.stepper.set(0)
         self.analysis_table.clear()
@@ -186,7 +245,8 @@ class DriversPage(Page):
                      if d.status == driver_analysis.VENDOR_UPDATE and not d.can_auto_install)
         attention = report.count(driver_analysis.PROBLEM, driver_analysis.GENERIC)
         unverified = report.count(*UNVERIFIABLE)
-        verified = report.count(driver_analysis.VERIFIED)
+        verified = report.count(driver_analysis.VERIFIED, driver_analysis.OPTIONAL)
+        optional = report.count(driver_analysis.OPTIONAL)
         parts = []
         if auto:
             parts.append(f"{auto} à mettre à jour")
@@ -194,7 +254,14 @@ class DriversPage(Page):
             parts.append(f"{manual} à télécharger")
         if attention:
             parts.append(f"{attention} à corriger")
-        info = [f"{unverified} non vérifiable(s)"] if unverified else []
+        info = [f"{optional} version(s) générique(s)"] if optional else []
+        if unverified:
+            info.append(f"{unverified} non vérifiable(s)")
+        # L'onglet Windows Update reflète la recherche faite pendant l'analyse.
+        if self.app.driver_service.last_results is not None:
+            self._fill_updates(self.app.driver_service.last_results)
+        if self._loaded_installed and self.tabs.get() == TABS[2]:
+            self.load_installed()
         if parts or info:
             summary = " • ".join(parts + info)
         elif verified:
@@ -243,7 +310,11 @@ class DriversPage(Page):
             when = device.checked_at.strftime("%d/%m/%Y à %H:%M") if device.checked_at else "—"
             line = f"Vérifié par : {device.checked_source}   •   le {when}"
             if device.latest_version and not device.wu_update_ids:
-                line += f"   •   Dernière version publiée : {device.latest_version}"
+                label = ("Version générique publiée" if device.status == driver_analysis.OPTIONAL
+                         else "Dernière version publiée")
+                line += f"   •   {label} : {device.latest_version}"
+            if device.count > 1:
+                line += f"   •   {device.count} composants concernés"
             lines.append(line)
         elif device.status in UNVERIFIABLE:
             lines.append("Non vérifié : " + (device.no_api_note or
@@ -257,6 +328,11 @@ class DriversPage(Page):
         if device.wu_update_ids:
             buttons.append(success_button(self.detail_buttons, "Installer automatiquement",
                                           lambda: self.start_install(device.wu_update_ids), width=10, state=state))
+        elif device.catalog_driver is not None:
+            job = (device.catalog_driver, list(device.device_ids), device.name)
+            buttons.append(success_button(self.detail_buttons,
+                                          f"Télécharger et installer ({device.catalog_driver.size_text})",
+                                          lambda: self.install_plan(catalog=[job]), width=10, state=state))
         elif device.nvidia_driver and device.nvidia_driver.download_url:
             nv = device.nvidia_driver
             buttons.append(success_button(self.detail_buttons, f"Télécharger et installer ({nv.size_text})",
@@ -278,17 +354,212 @@ class DriversPage(Page):
             self.start_analysis()
             return
         wu_ids = [uid for d in self.report.devices for uid in d.wu_update_ids]
-        nv = next((d.nvidia_driver for d in self.report.devices if d.nvidia_driver), None)
-        if not wu_ids and not nv:
+        catalog = self._catalog_jobs(self.report.devices)
+        nv = next((d.nvidia_driver for d in self.report.devices
+                   if d.nvidia_driver and d.nvidia_driver.download_url), None)
+        if not wu_ids and not catalog and not nv:
             show_info(self, "Rien à installer",
                       "Aucun pilote ne peut être mis à jour automatiquement.\n\n"
                       "Pour les autres lignes (mise à jour chez le fabricant, non vérifiable), sélectionnez-les : "
                       "le bouton « Télécharger » ouvre la page officielle la plus précise.")
             return
-        if wu_ids:
-            self.start_install(wu_ids, on_complete=(lambda: self.install_nvidia(nv)) if nv else None)
+        self.install_plan(wu_ids, catalog, nv)
+
+    @staticmethod
+    def _catalog_jobs(devices: list[DeviceStatus]) -> list[CatalogJob]:
+        """Un téléchargement par pilote du catalogue, même s'il concerne plusieurs lignes."""
+        jobs: dict[str, CatalogJob] = {}
+        for d in devices:
+            if d.catalog_driver is not None:
+                _drv, ids, _name = jobs.setdefault(d.catalog_driver.update_id, (d.catalog_driver, [], d.name))
+                ids.extend(d.device_ids)
+        return list(jobs.values())
+
+    # ------------------------------------------------------------------ installation (toutes sources)
+    def install_plan(self, wu_ids: list[str] | None = None, catalog: list[CatalogJob] | None = None,
+                     nv: nvidia.NvidiaDriver | None = None) -> None:
+        """Installe dans l'ordre : Windows Update, Catalogue Microsoft, puis NVIDIA (installateur à suivre).
+
+        La liste des pilotes est relue automatiquement à la fin, pour afficher les versions réellement en place.
+        """
+        wu_ids, catalog = list(wu_ids or []), list(catalog or [])
+        if self.busy or not (wu_ids or catalog or nv):
+            return
+        if (wu_ids or catalog) and not self.is_admin:
+            if ask_yes_no(self, "Droits administrateur requis",
+                          "L'installation de pilotes nécessite les droits administrateur.\n\n"
+                          "Relancer l'application en tant qu'administrateur ?"):
+                self.app.restart_as_admin()
+            return
+        known = {u.update_id: u.title for u in (self.app.driver_service.last_results or [])}
+        known.update({k: u.title for k, u in self.updates.items()})
+        items = [f"• {known.get(i, i)}  (Windows Update)" for i in wu_ids]
+        items += [f"• {name if drv.version in name else f'{name} : {drv.version}'} — {drv.size_text}  "
+                  "(Catalogue Microsoft)" for drv, _ids, name in catalog]
+        if nv:
+            items.append(f"• Carte graphique NVIDIA {nv.version} — {nv.size_text}  (nvidia.com)")
+        listing = "\n".join(items[:12]) + ("\n• …" if len(items) > 12 else "")
+        extra = ("\n\nL'installateur NVIDIA s'ouvrira en dernier : choisissez « Installation express ». L'écran "
+                 "peut clignoter quelques secondes." if nv else "")
+        if not ask_yes_no(self, "Installer les pilotes",
+                          f"Installer {len(items)} pilote(s) ?\n\n{listing}\n\nChaque fichier vient d'un site "
+                          "officiel et sa signature est vérifiée avant l'installation. Ne débranchez pas les "
+                          f"appareils concernés pendant l'installation.{extra}"):
+            return
+        self.cancel.clear()
+        self._set_busy(True)
+        self.stepper.set(2)
+        if (wu_ids or catalog) and self.restore_var.get():
+            self.status.busy("Création d'un point de restauration (sécurité)…")
+            self.dispatcher.run(drivers.create_restore_point, "NPone29 Cleaner — avant mise à jour des pilotes",
+                                on_done=lambda res: self._after_restore_point(res, wu_ids, catalog, nv),
+                                on_error=lambda exc: self._after_restore_point(None, wu_ids, catalog, nv))
         else:
-            self.install_nvidia(nv)
+            self._run_plan(wu_ids, catalog, nv)
+
+    def _after_restore_point(self, result, wu_ids: list[str], catalog: list[CatalogJob], nv) -> None:
+        if result is None or not result.ok:
+            detail = (result.output if result else "") or "erreur inconnue"
+            if not ask_yes_no(self, "Point de restauration",
+                              "Le point de restauration n'a pas pu être créé (la protection du système est "
+                              f"peut-être désactivée).\n\nDétail : {detail[:400]}\n\nContinuer quand même ?"):
+                self._set_busy(False)
+                self.status.idle("Installation annulée.")
+                return
+        self._run_plan(wu_ids, catalog, nv)
+
+    def _run_plan(self, wu_ids: list[str], catalog: list[CatalogJob], nv) -> None:
+        if not (wu_ids or catalog):
+            self._set_busy(False)
+            self._download_nvidia(nv, None)
+            return
+        wu_progress = self.dispatcher.wrap(self._on_install_progress)
+        progress = self.dispatcher.wrap(self.status.progress)
+        busy = self.dispatcher.wrap(self.status.busy)
+        service = self.app.driver_service
+        cancel = self.cancel
+        known = {u.update_id: u.title for u in (service.last_results or [])}
+        known.update({k: u.title for k, u in self.updates.items()})
+        self._show_install_controls(True)
+
+        def new_skip() -> threading.Event:
+            skip = threading.Event()
+            if cancel.is_set():
+                skip.set()
+            self._current_skip = skip
+            return skip
+
+        def install_windows_update() -> InstallReport:
+            skip = new_skip()
+            partial = InstallReport()      # rempli au fur et à mesure par le thread Windows Update
+            future = service.install(wu_ids, wu_progress, skip, partial)
+            error = ""
+            while True:
+                try:
+                    future.result(timeout=0.5)
+                    break
+                except FutureTimeout:
+                    if skip.is_set():
+                        # Installation bloquée : on l'abandonne (l'appel Windows continue seul) et on passe
+                        # aux pilotes suivants.
+                        service.abandon()
+                        break
+                except Exception as exc:
+                    error = drivers.com_error_message(exc)
+                    break
+            wu = InstallReport(list(partial.outcomes), partial.reboot_required)
+            done = {o.update_id for o in wu.outcomes}
+            reason = error or ("Arrêt demandé" if cancel.is_set() else "Passé : installation interrompue")
+            wu.outcomes += [InstallOutcome(i, known.get(i, i), False, reason) for i in wu_ids if i not in done]
+            return wu
+
+        def work() -> InstallReport:
+            report = InstallReport()
+            if wu_ids:
+                busy("Windows Update : préparation de l'installation…")
+                wu = install_windows_update()
+                report.outcomes.extend(wu.outcomes)
+                report.reboot_required |= wu.reboot_required
+            for n, (drv, ids, name) in enumerate(catalog, start=1):
+                if cancel.is_set():
+                    report.outcomes.append(InstallOutcome(drv.update_id, f"{name} — {drv.version}", False,
+                                                          "Arrêt demandé"))
+                    continue
+                skip = new_skip()
+                label = f"Catalogue Microsoft ({n}/{len(catalog)}) : {name}"
+
+                def on_download(done: int, total: int, label=label) -> None:
+                    if total:
+                        progress(done / total, f"{label} — téléchargement {human_size(done)} / {human_size(total)}")
+
+                busy(f"{label} — téléchargement…")
+                try:
+                    out = microsoft_catalog.install(drv, ids, on_download, skip,
+                                                    phase=lambda text, label=label: busy(f"{label} — {text}"),
+                                                    title=f"{name} — {drv.version}")
+                    report.outcomes.append(InstallOutcome(drv.update_id, out.title, out.success, out.message))
+                    report.reboot_required |= out.reboot_required
+                except DownloadCancelled:
+                    report.outcomes.append(InstallOutcome(drv.update_id, f"{name} — {drv.version}", False,
+                                                          "Arrêt demandé" if cancel.is_set() else "Passé"))
+                except Exception as exc:
+                    log.exception("Installation du pilote %s impossible", drv.title)
+                    report.outcomes.append(InstallOutcome(drv.update_id, f"{name} — {drv.version}", False,
+                                                          str(exc)))
+            return report
+
+        self.dispatcher.run(work, on_done=lambda report: self._plan_done(report, None if cancel.is_set() else nv),
+                            on_error=self._install_error, on_finally=lambda: self._set_busy(False))
+
+    def _on_install_progress(self, index: int, total: int, title: str, phase: str) -> None:
+        self.status.progress((index - 1) / max(total, 1),
+                             f"Windows Update — {phase} ({index}/{total}) : {title} (bloqué ? « Passer ce pilote »)")
+
+    def _plan_done(self, report: InstallReport, nv) -> None:
+        summary = f"{report.succeeded} pilote(s) installé(s), {report.failed} échec(s)."
+        for outcome in report.outcomes:
+            if outcome.success and outcome.update_id in self.updates:
+                self.updates_table.update_row(outcome.update_id, tags=("ok",))
+        self.app.notify("Installation des pilotes terminée", summary, "success" if not report.failed else "warning")
+        if nv:
+            # Le pilote NVIDIA vient en dernier : son installateur est interactif.
+            self.status.idle(f"{summary} Préparation du pilote NVIDIA…")
+            self.after(150, lambda: self._download_nvidia(nv, report))
+            return
+        self.stepper.set(len(STEPS))
+        self.status.idle(f"{summary} Actualisation de la liste des pilotes…")
+        self._show_install_result(report)
+        self._refresh_after_install()
+
+    def _install_error(self, exc: BaseException) -> None:
+        self.status.idle(f"Installation impossible : {exc}")
+        self.app.notify("Installation des pilotes impossible", str(exc), "error")
+        self._refresh_after_install()   # une partie a peut-être été installée
+
+    def _show_install_result(self, report: InstallReport, extra_stats: list[tuple[str, str]] | None = None,
+                             extra_tips: list[str] | None = None, headline: str = "") -> None:
+        summary = headline or f"{report.succeeded} pilote(s) installé(s), {report.failed} échec(s)."
+        stats = [("Installés", str(report.succeeded)), ("Échecs", str(report.failed))] if report.outcomes else []
+        stats += extra_stats or []
+        tips = [f"{'✓' if o.success else '✗'} {o.title} — {o.message}" for o in report.outcomes]
+        tips += extra_tips or []
+        tips.append("La liste des pilotes s'actualise automatiquement pour afficher les versions en place.")
+        actions = [("Redémarrer maintenant (recommandé)", self._reboot)] if report.reboot_required else []
+        ResultDialog(self, "Installation terminée", summary, stats, tips, actions,
+                     level="success" if not report.failed else "warning")
+
+    def _refresh_after_install(self) -> None:
+        """Relit les pilotes après une installation pour afficher les versions réellement en place."""
+        self._loaded_installed = False
+        self._loaded_problems = False
+        if self.busy:
+            self._pending_refresh = True
+            return
+        self._pending_refresh = False
+        current = self.tabs.get()
+        if current == TABS[3]:
+            self.load_problems()
+        self.start_analysis(switch=False)
 
     # ------------------------------------------------------------------ installation NVIDIA
     def install_nvidia(self, nv: nvidia.NvidiaDriver | None) -> None:
@@ -300,9 +571,23 @@ class DriversPage(Page):
                           "L'installateur de NVIDIA s'ouvrira : choisissez « Installation express ». "
                           "L'écran peut clignoter quelques secondes pendant l'installation."):
             return
+        self._download_nvidia(nv, None)
+
+    def _download_nvidia(self, nv: nvidia.NvidiaDriver | None, previous: InstallReport | None) -> None:
+        """Télécharge et vérifie le pilote NVIDIA, lance son installateur et actualise la liste à sa fermeture.
+
+        `previous` : bilan des pilotes installés juste avant (« Tout mettre à jour »), repris dans le bilan final.
+        """
+        if nv is None:
+            return
+        if self.busy:       # l'opération précédente se termine : on réessaie juste après
+            self.after(500, lambda: self._download_nvidia(nv, previous))
+            return
         self.cancel.clear()
         self._set_busy(True)
         self.stepper.set(2)
+        self._show_install_controls(True)
+        self._current_skip = self.cancel
         self.status.progress(0, "Téléchargement du pilote NVIDIA…")
 
         def on_progress(done: int, total: int) -> None:
@@ -311,9 +596,10 @@ class DriversPage(Page):
                                                    f"{human_size(total)}")
 
         progress = self.dispatcher.wrap(on_progress)
+        cancel = self.cancel
 
         def work():
-            path = download_file(nv.download_url, nvidia.ALLOWED_DOWNLOAD_HOSTS, progress, self.cancel)
+            path = download_file(nv.download_url, nvidia.ALLOWED_DOWNLOAD_HOSTS, progress, cancel)
             ok, detail = verify_signature(path, "NVIDIA Corporation")
             return path, ok, detail
 
@@ -325,21 +611,20 @@ class DriversPage(Page):
                              f"Le fichier téléchargé n'est pas signé par NVIDIA ({detail}).\n"
                              "Par sécurité, il ne sera pas lancé.")
                 path.unlink(missing_ok=True)
-                return
-            try:
-                os.startfile(str(path))  # l'installateur NVIDIA demande lui-même les droits admin
-            except OSError as exc:
-                self.status.idle(f"Impossible de lancer l'installateur : {exc}")
+                if previous is not None:
+                    self._refresh_after_install()
                 return
             self.stepper.set(len(STEPS))
-            self.status.idle("L'installateur NVIDIA est ouvert : suivez ses étapes.")
+            self.status.idle("L'installateur NVIDIA est ouvert : suivez ses étapes. La liste des pilotes sera "
+                             "actualisée automatiquement à sa fermeture.")
             self.app.notify("Pilote NVIDIA téléchargé", "L'installateur est ouvert : suivez ses étapes.", "success")
-            ResultDialog(self, "Pilote NVIDIA", "L'installateur NVIDIA est lancé",
-                         stats=[("Version", nv.version), ("Fichier vérifié", "signé par NVIDIA Corporation")],
-                         tips=["Choisissez « Installation express » si on vous le demande.",
-                               "L'écran peut devenir noir ou clignoter quelques secondes : c'est normal.",
-                               "Une fois terminé, redémarrez le PC puis relancez l'analyse pour vérifier."],
-                         actions=[("Relancer l'analyse des pilotes", self.start_analysis)])
+            self._wait_for_installer(path)
+            report = previous or InstallReport()
+            self._show_install_result(
+                report, headline="L'installateur NVIDIA est lancé",
+                extra_stats=[("Pilote NVIDIA", nv.version), ("Fichier vérifié", "signé par NVIDIA Corporation")],
+                extra_tips=["Choisissez « Installation express » si on vous le demande.",
+                            "L'écran peut devenir noir ou clignoter quelques secondes : c'est normal."])
 
         def error(exc: BaseException) -> None:
             if isinstance(exc, DownloadCancelled):
@@ -347,8 +632,32 @@ class DriversPage(Page):
             else:
                 self.status.idle(f"Téléchargement impossible : {exc}")
                 self.app.notify("Téléchargement impossible", str(exc), "error")
+            if previous is not None:
+                self._refresh_after_install()
 
         self.dispatcher.run(work, on_done=done, on_error=error, on_finally=lambda: self._set_busy(False))
+
+    def _wait_for_installer(self, path) -> None:
+        """Lance l'installateur (hors de l'interface) et actualise les pilotes quand il se ferme."""
+        def wait():
+            code = launch_and_wait(path)
+            if code is not None:
+                try:
+                    path.unlink(missing_ok=True)      # plusieurs centaines de Mo, inutile une fois installé
+                except OSError:
+                    pass
+            return code
+
+        def finished(code) -> None:
+            if code is None:
+                self.status.idle("L'installateur NVIDIA n'a pas pu être lancé (autorisation refusée ?).")
+                self._refresh_after_install()
+                return
+            self.app.notify("Installateur NVIDIA fermé", "La liste des pilotes est en cours d'actualisation.", "info")
+            self._refresh_after_install()
+
+        self.dispatcher.run(wait, on_done=finished,
+                            on_error=lambda exc: self.status.idle(f"Installateur NVIDIA : {exc}"))
 
     # ================================================================== WINDOWS UPDATE
     def _build_updates_tab(self) -> ctk.CTkFrame:
@@ -443,78 +752,15 @@ class DriversPage(Page):
         self.status.idle(f"Recherche impossible : {exc}")
         self.app.notify("Windows Update indisponible", str(exc), "error")
 
-    def start_install(self, ids: list[str] | None = None, on_complete=None) -> None:
+    def start_install(self, ids: list[str] | None = None) -> None:
+        """Installe des pilotes proposés par Windows Update (onglet Windows Update ou ligne de l'analyse)."""
         if self.busy:
             return
         ids = ids if ids is not None else self.updates_table.checked()
         if not ids:
             self.status.set_text("Cochez au moins un pilote à installer.")
             return
-        if not self.is_admin:
-            if ask_yes_no(self, "Droits administrateur requis",
-                          "L'installation de pilotes nécessite les droits administrateur.\n\n"
-                          "Relancer l'application en tant qu'administrateur ?"):
-                self.app.restart_as_admin()
-            return
-        known = {u.update_id: u.title for u in (self.app.driver_service.last_results or [])}
-        known.update({k: u.title for k, u in self.updates.items()})
-        names = "\n".join(f"• {known.get(i, i)}" for i in ids[:10]) + ("\n• …" if len(ids) > 10 else "")
-        if not ask_yes_no(self, "Installer les pilotes",
-                          f"Installer {len(ids)} pilote(s) depuis Windows Update ?\n\n{names}\n\n"
-                          "Ne débranchez pas l'appareil concerné pendant l'installation."):
-            return
-
-        self._after_install = on_complete
-        self._set_busy(True)
-        self.stepper.set(2)
-        if self.restore_var.get():
-            self.status.busy("Création d'un point de restauration (sécurité)…")
-            self.dispatcher.run(drivers.create_restore_point, "NPone29 Cleaner — avant mise à jour des pilotes",
-                                on_done=lambda res: self._after_restore_point(res, ids),
-                                on_error=lambda exc: self._after_restore_point(None, ids))
-        else:
-            self._install(ids)
-
-    def _after_restore_point(self, result, ids: list[str]) -> None:
-        if result is None or not result.ok:
-            detail = (result.output if result else "") or "erreur inconnue"
-            if not ask_yes_no(self, "Point de restauration",
-                              "Le point de restauration n'a pas pu être créé (la protection du système est "
-                              f"peut-être désactivée).\n\nDétail : {detail[:400]}\n\nContinuer quand même ?"):
-                self._set_busy(False)
-                self.status.idle("Installation annulée.")
-                return
-        self._install(ids)
-
-    def _install(self, ids: list[str]) -> None:
-        progress = self.dispatcher.wrap(self._on_install_progress)
-        self.status.busy("Préparation de l'installation…")
-        self.dispatcher.watch(self.app.driver_service.install(ids, progress), on_done=self._install_done,
-                              on_error=self._search_error, on_finally=lambda: self._set_busy(False))
-
-    def _on_install_progress(self, index: int, total: int, title: str, phase: str) -> None:
-        self.status.progress((index - 1) / max(total, 1), f"{phase} ({index}/{total}) : {title}")
-
-    def _install_done(self, report: InstallReport) -> None:
-        summary = f"{report.succeeded} pilote(s) installé(s), {report.failed} échec(s)."
-        self.status.idle(summary)
-        self.stepper.set(len(STEPS))
-        for outcome in report.outcomes:
-            if outcome.success:
-                self.updates_table.update_row(outcome.update_id, tags=("ok",))
-        self.app.notify("Installation des pilotes terminée", summary, "success" if not report.failed else "warning")
-        stats = [("Installés", str(report.succeeded)), ("Échecs", str(report.failed))]
-        tips = [f"{'✓' if o.success else '✗'} {o.title} — {o.message}" for o in report.outcomes]
-        actions = []
-        if report.reboot_required:
-            actions.append(("Redémarrer maintenant (recommandé)", self._reboot))
-        follow = self._after_install
-        self._after_install = None
-        if follow:
-            actions.insert(0, ("Continuer : pilote de la carte graphique", follow))
-        actions.append(("Relancer l'analyse des pilotes", self.start_analysis))
-        ResultDialog(self, "Installation terminée", summary, stats, tips, actions,
-                     level="success" if not report.failed else "warning")
+        self.install_plan(wu_ids=ids)
 
     def _reboot(self) -> None:
         if ask_yes_no(self, "Redémarrer", "Enregistrez votre travail. Redémarrer le PC dans 10 secondes ?"):

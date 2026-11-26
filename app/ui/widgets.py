@@ -210,6 +210,11 @@ class Table(ctk.CTkFrame):
             self._apply_sort()
         self._render()
 
+    def row_values(self, iid: str) -> list[Any]:
+        """Valeurs affichées d'une ligne (liste vide si elle n'existe pas)."""
+        row = self._rows.get(iid)
+        return list(row["values"]) if row else []
+
     def update_row(self, iid: str, values: list[Any] | None = None, sort_values: list[Any] | None = None,
                    tags: tuple[str, ...] | None = None) -> None:
         row = self._rows.get(iid)

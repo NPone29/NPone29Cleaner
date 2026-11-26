@@ -12,7 +12,7 @@ et des logiciels, et les petits outils d'entretien du quotidien.
 | **Mon PC** | Carte interactive du matériel (processeur, mémoire et emplacements libres, carte graphique, disques, réseau, audio, écran, ventilation, batterie) avec explications simples, caractéristiques, conseils et températures en direct. Bouton « Copier la configuration ». |
 | **Sauvegarde** | Copie les dossiers choisis (Documents, Bureau, Images… ou tout autre dossier) sur un disque externe, une clé USB ou un dossier réseau. Sauvegarde **complète**, **différentielle** ou **incrémentale**, au choix. Les fichiers sont copiés **en clair** et restent lisibles directement depuis le disque, même sans l'application. Onglet Restaurer : restauration exacte à la date choisie (dans un dossier ou à l'emplacement d'origine), recherche d'un fichier, ouverture directe, vérification, suppression des anciennes sauvegardes. Prévient si la destination est sur le même disque physique que les données. |
 | **Nettoyage** | Analyse puis supprime : corbeille, fichiers temporaires, miniatures, rapports de plantage, cache Windows Update, Delivery Optimization, shaders DirectX/NVIDIA/AMD, journaux, caches de Chrome / Edge / Brave / Vivaldi / Opera / Firefox, Discord, Steam, Teams, Spotify, VS Code, pip, npm. Prévient si un navigateur ouvert bloque une partie du nettoyage, puis affiche un bilan (espace libre avant → après). |
-| **Pilotes** | **Analyse complète** de chaque périphérique avec trois états honnêtes : **À jour (vérifié)**, **Mise à jour disponible**, **Non vérifiable**. Un pilote n'est jamais affiché « à jour » sans source fiable : Windows Update, nvidia.com (cartes NVIDIA) ou le catalogue officiel du fabricant pour les PC **Dell**, **HP** et **Lenovo**. Chaque ligne indique la source utilisée et la date de la vérification. Bouton **Télécharger** vers la page la plus précise : fichier ou page exacte du pilote quand la source la fournit, sinon page de support pré-remplie (modèle du PC / de la carte mère, ID matériel dans le Catalogue Microsoft). Quand un fabricant n'a pas de service public (Intel, AMD, Realtek, ASUS, MSI, Gigabyte, ASRock, Acer…), l'interface le dit au lieu de deviner. Installation automatique via Windows Update ou de l'installateur NVIDIA officiel (signature vérifiée). Point de restauration automatique, inventaire, périphériques en erreur. |
+| **Pilotes** | **Analyse complète** de chaque périphérique avec trois états honnêtes : **À jour (vérifié)**, **Mise à jour disponible**, **Non vérifiable**. Un pilote n'est jamais affiché « à jour » sans source fiable : Windows Update, le **Catalogue Microsoft Update** (pilotes Intel, Realtek, Killer, Acer… publiés pour l'identifiant exact du matériel, classés selon les règles de Windows), nvidia.com (cartes NVIDIA) ou le catalogue officiel du fabricant pour les PC **Dell**, **HP** et **Lenovo**. Chaque ligne indique la source utilisée et la date de la vérification. Bouton **Télécharger** vers la page la plus précise : fichier ou page exacte du pilote quand la source la fournit, sinon page de support pré-remplie (modèle du PC / de la carte mère, ID matériel dans le Catalogue Microsoft). Quand aucune source ne connaît un pilote, l'interface le dit au lieu de deviner. Installation automatique via Windows Update, depuis le Catalogue Microsoft (empreinte SHA-256 et signature Microsoft vérifiées, puis `pnputil`) ou de l'installateur NVIDIA officiel (signature vérifiée). **La liste s'actualise toute seule** après chaque installation (et à la fermeture de l'installateur NVIDIA). Point de restauration automatique, inventaire, périphériques en erreur. |
 | **Logiciels** | Liste les logiciels à mettre à jour et les met à jour en silence via **winget**. |
 | **Démarrage** | Active/désactive les programmes lancés au démarrage (même mécanisme que le Gestionnaire des tâches, 100 % réversible). |
 | **Désinstallation** | Liste des programmes installés, recherche, désinstallation via le désinstalleur officiel. |
@@ -37,17 +37,29 @@ Thème sombre / clair / système, réglages mémorisés dans `%APPDATA%\NPone29C
 - Les pilotes installés automatiquement viennent de Windows Update ou du site officiel du fabricant
   (NVIDIA : téléchargement HTTPS limité aux domaines `*.nvidia.com` + vérification de la signature numérique
   « NVIDIA Corporation » avant le lancement). Aucun site de pilotes tiers.
+- Catalogue Microsoft Update : recherche par identifiant de puce sur `www.catalog.update.microsoft.com`,
+  fichier téléchargé en HTTPS depuis `*.download.windowsupdate.com`, empreinte SHA-256 comparée à celle
+  annoncée par Microsoft et signature « Microsoft Corporation » vérifiée avant l'installation (`pnputil`).
+  Seuls sont proposés les pilotes que **Windows choisirait lui-même** : le pilote doit déclarer un identifiant
+  du périphérique au moins aussi précis que celui du pilote installé (lu dans le registre), être plus récent
+  (date, puis version), venir du même fabricant et être prévu pour cette version de Windows et ce processeur.
+  Une version générique plus récente mais moins précise (ex. pilote Intel générique alors qu'Acer fournit le
+  sien) est seulement signalée (« Version générique dispo. »). Les composants Intel Smart Sound ne sont jamais
+  installés seuls (ils vont avec le pilote audio). Après l'installation, l'application relit la version
+  réellement utilisée ; si Windows a gardé l'ancien pilote, il n'est plus reproposé.
 - Un point de restauration est créé avant l'installation de pilotes (option cochée par défaut).
 - Pilotes Dell, HP et Lenovo : l'application **ouvre** le lien officiel dans le navigateur ; elle ne télécharge
   ni n'exécute elle-même aucun installateur de ces fabricants. Seuls les catalogues (fichiers XML/CAB) sont
   téléchargés, en HTTPS, depuis les domaines officiels : `downloads.dell.com`, `hpia.hpcloud.hp.com`,
   `ftp.hp.com`, `download.lenovo.com`. Toute redirection hors de ces domaines est refusée, et les liens
   proposés sont filtrés par domaine officiel (sauf la recherche Google limitée au site du fabricant).
-- Données envoyées : le modèle de la carte graphique (NVIDIA), l'identifiant de plateforme HP (ex. `8DE2`)
+- Données envoyées : l'identifiant des puces (ex. `PCI\VEN_8086&DEV_06F0&SUBSYS_00748086`, Catalogue
+  Microsoft), le modèle de la carte graphique (NVIDIA), l'identifiant de plateforme HP (ex. `8DE2`)
   et le type de machine Lenovo (ex. `20XW`) dans l'adresse du catalogue. Le catalogue Dell est téléchargé en
   entier et filtré sur le PC avec l'identifiant de modèle (SKU). **Jamais** de numéro de série ni de service
   tag. L'inventaire « Mon PC » reste sur le PC.
-- Les catalogues sont gardés 24 h dans `%LOCALAPPDATA%\NPone29Cleaner\cache\drivers`.
+- Les catalogues sont gardés 24 h dans `%LOCALAPPDATA%\NPone29Cleaner\cache\drivers` (Catalogue Microsoft :
+  recherches 12 h, fiches des pilotes 60 jours).
 - PC Dell : la version d'un paquet Dell n'est souvent pas celle du pilote qu'il installe (paquet Intel Ethernet
   20.0.3.28 → pilote 12.19.2.66). L'application lit donc, sur le PC uniquement, les journaux des paquets Dell
   déjà installés (`C:\ProgramData\Dell\UpdatePackage\Log`) : un paquet installé avec succès n'est plus redemandé.
@@ -134,6 +146,7 @@ app/
     driver_sources/        une classe par fabricant : vérification de version et/ou liens officiels
       base.py                contrat commun (DriverSource), versions, cache, téléchargement HTTPS limité
       nvidia_source.py       nvidia.com
+      microsoft_catalog.py   Catalogue Microsoft Update (tous fabricants, règles de classement de Windows)
       dell.py, hp.py, lenovo.py   catalogues officiels des PC de marque
       chipmakers.py          Intel, AMD, autres fabricants de puces (liens seuls)
       boards.py              ASUS, MSI, Gigabyte, ASRock, Acer… (pages support, liens seuls)
@@ -171,9 +184,13 @@ elle apparaît automatiquement dans l'interface.
   des PC (seuls ceux de la carte graphique NVIDIA le sont, via `nvidia-smi`) : la page « Mon PC » oriente
   vers l'outil du fabricant de la carte mère.
 - La vérification « chez le fabricant » est automatique pour NVIDIA et pour les PC Dell, HP et Lenovo. Pour
-  Intel, AMD, Realtek, ASUS, MSI, Gigabyte, ASRock, Acer, etc., aucun service public fiable n'existe : ces
-  pilotes sont « Non vérifiables » et l'application ouvre la bonne page officielle (ou une recherche limitée
-  au site). Sur un PC assemblé, la plupart des pilotes seront donc « Non vérifiables » : c'est voulu.
+  Intel, AMD, Realtek, Acer, etc., c'est le Catalogue Microsoft Update qui sert de référence : il contient les
+  pilotes publiés pour Windows, mais pas toujours les toutes dernières versions génériques du site du
+  fabricant de la puce (Intel, AMD…). Un pilote absent du catalogue reste « Non vérifiable » et l'application
+  ouvre la bonne page officielle.
+- Le catalogue n'a pas d'API officielle : l'application lit ses pages web (première page de résultats, 25
+  lignes par recherche). Pour une puce très répandue (ex. Intel UHD), la recherche sans SUBSYS est dominée par
+  les pilotes d'autres marques de PC : la recherche avec l'identifiant exact du PC est donc faite en premier.
 - Dell, HP, Lenovo : seuls les pilotes présents dans le catalogue du modèle sont vérifiés (Dell : uniquement
   les périphériques PCI). Une version que le fabricant n'écrit pas sous forme numérique (ex. « 6.0.9.1 Rev.A »)
   n'est pas comparée : le pilote reste « Non vérifiable ».
