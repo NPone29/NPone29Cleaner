@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import logging
 import threading
+import tkinter.font as tkfont
 from concurrent.futures import TimeoutError as FutureTimeout
 
 import customtkinter as ctk
@@ -28,6 +29,8 @@ log = logging.getLogger(__name__)
 
 TABS = ["Analyse complète", "Windows Update", "Pilotes installés", "Périphériques en erreur"]
 STEPS = ["Analyser", "Vérifier", "Mettre à jour", "Terminé"]
+DETAIL_MAX_LINES = 5     # lignes de description visibles sous la liste par défaut (le reste défile)
+DETAIL_LINES_RANGE = (2, 20)
 STATUS_TAGS = {
     driver_analysis.PROBLEM: ("error",), driver_analysis.UPDATE: ("warn",),
     driver_analysis.VENDOR_UPDATE: ("warn",), driver_analysis.GENERIC: ("warn",),
@@ -199,23 +202,90 @@ class DriversPage(Page):
         ], selectmode="browse", on_select=self._render_detail, height=7)
         self.analysis_table.grid(row=3, column=0, sticky="nsew")
 
+        # Poignée à glisser : agrandit la liste (vers le bas) ou la description (vers le haut).
+        self.detail_lines = self._saved_detail_lines()
+        self._grip_start: tuple[int, int] | None = None
+        grip = self.detail_grip = ctk.CTkFrame(frame, height=12, fg_color="transparent", cursor="sb_v_double_arrow")
+        grip.grid(row=4, column=0, sticky="ew")
+        handle = ctk.CTkFrame(grip, width=56, height=4, corner_radius=2, fg_color=("gray72", "gray38"),
+                              cursor="sb_v_double_arrow")
+        handle.place(relx=0.5, rely=0.5, anchor="center")
+        for widget in (grip, handle):
+            widget.bind("<ButtonPress-1>", self._grip_press)
+            widget.bind("<B1-Motion>", self._grip_drag)
+            widget.bind("<ButtonRelease-1>", self._grip_release)
+
         self.detail = Card(frame)
-        self.detail.grid(row=4, column=0, sticky="ew", pady=(8, 0))
+        self.detail.grid(row=5, column=0, sticky="ew")
         self.detail.grid_columnconfigure(0, weight=1)
         self.detail_title = ctk.CTkLabel(self.detail, text="Sélectionnez un périphérique dans la liste",
                                          font=theme.font(14, "bold"), anchor="w")
         self.detail_title.grid(row=0, column=0, sticky="w", padx=16, pady=(12, 0))
-        self.detail_text = ctk.CTkLabel(self.detail, text="", font=theme.font(12), text_color=theme.MUTED,
-                                        anchor="w", justify="left", wraplength=860)
-        self.detail_text.grid(row=1, column=0, sticky="ew", padx=16, pady=(2, 6))
+        # Description complète, mais limitée à DETAIL_MAX_LINES lignes à l'écran (elle défile au-delà) :
+        # une longue explication ne doit jamais réduire la liste des pilotes à quelques lignes.
+        self.detail_text = ctk.CTkTextbox(self.detail, font=theme.font(12), text_color=theme.MUTED,
+                                          fg_color="transparent", border_width=0, wrap="word", height=24)
+        self.detail_text.grid(row=1, column=0, sticky="ew", padx=10, pady=(0, 2))
+        self.detail_text.configure(state="disabled")
         self.detail_buttons = ctk.CTkFrame(self.detail, fg_color="transparent", width=1, height=1)
         self.detail_buttons.grid(row=2, column=0, sticky="ew", padx=12, pady=(0, 12))
-        self.detail.bind("<Configure>", self._rewrap_detail, add="+")
+        self.detail_text.bind("<Configure>", lambda _e: self._fit_detail_height(), add="+")
         return frame
 
-    def _rewrap_detail(self, event) -> None:
-        scaling = ctk.ScalingTracker.get_widget_scaling(self.detail)
-        self.detail_text.configure(wraplength=max(300, int(event.width / scaling) - 40))
+    def _saved_detail_lines(self) -> int:
+        try:
+            value = int(self.app.settings.get("drivers_detail_lines", DETAIL_MAX_LINES))
+        except (TypeError, ValueError):
+            value = DETAIL_MAX_LINES
+        return max(DETAIL_LINES_RANGE[0], min(DETAIL_LINES_RANGE[1], value))
+
+    def _detail_line_px(self) -> int:
+        try:
+            return max(8, tkfont.Font(font=self.detail_text._textbox.cget("font")).metrics("linespace"))
+        except Exception:
+            return 16
+
+    def _grip_press(self, event) -> None:
+        self._grip_start = (event.y_root, self.detail_lines)
+
+    def _grip_drag(self, event) -> None:
+        if self._grip_start is None:
+            return
+        start_y, start_lines = self._grip_start
+        lines = start_lines + round((start_y - event.y_root) / self._detail_line_px())
+        lines = max(DETAIL_LINES_RANGE[0], min(DETAIL_LINES_RANGE[1], lines))
+        if lines != self.detail_lines:
+            self.detail_lines = lines
+            self._fit_detail_height()
+
+    def _grip_release(self, _event) -> None:
+        self._grip_start = None
+        self.app.settings.set("drivers_detail_lines", self.detail_lines)
+
+    def _set_detail_text(self, text: str) -> None:
+        self.detail_text.configure(state="normal")
+        self.detail_text.delete("1.0", "end")
+        self.detail_text.insert("1.0", text)
+        self.detail_text.configure(state="disabled")
+        self.detail_text.yview_moveto(0)
+        self.after_idle(self._fit_detail_height)
+
+    def _fit_detail_height(self) -> None:
+        """Hauteur de la description : celle du texte, sans dépasser DETAIL_MAX_LINES lignes."""
+        inner = self.detail_text._textbox
+        try:
+            count = inner.count("1.0", "end-1c", "displaylines")
+            lines = (count[0] if isinstance(count, tuple) else count) or 0
+            line_px = tkfont.Font(font=inner.cget("font")).metrics("linespace")
+        except Exception:
+            return
+        if not inner.get("1.0", "end-1c").strip():
+            lines = 0
+        shown = max(1, min(lines + 1, self.detail_lines))
+        scaling = ctk.ScalingTracker.get_widget_scaling(self.detail_text)
+        height = round(shown * line_px / scaling) + 8
+        if abs(self.detail_text.cget("height") - height) > 1:
+            self.detail_text.configure(height=height)
 
     def start_analysis(self, reuse: bool = False, switch: bool = True) -> None:
         if self.busy:
@@ -310,7 +380,7 @@ class DriversPage(Page):
         device = self._selected_device()
         if device is None:
             self.detail_title.configure(text="Sélectionnez un périphérique dans la liste")
-            self.detail_text.configure(text="")
+            self._set_detail_text("")
             return
         self.detail_title.configure(text=f"{device.status_label}   {device.name}",
                                     text_color=theme.TAG_COLORS.get(STATUS_TAGS.get(device.status, ("",))[0],
@@ -334,7 +404,7 @@ class DriversPage(Page):
         best = device.best_link
         if best:
             lines.append(f"« Télécharger » ouvre : {best.label}")
-        self.detail_text.configure(text="\n".join(lines))
+        self._set_detail_text("\n".join(lines))
         state = "disabled" if self.busy else "normal"
         buttons = []
         if device.wu_update_ids:

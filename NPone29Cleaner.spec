@@ -29,7 +29,9 @@ exe = EXE(
     console=False,               # application fenêtrée
     icon="assets/icon.ico",
     version="version_info.txt",  # infos visibles dans Propriétés > Détails
-    uac_admin=True,              # demande les droits admin au lancement (pilotes, fichiers système)
+    # Pas de demande administrateur au lancement : l'application s'ouvre normalement (mode limité) et propose
+    # « Relancer en administrateur » ; clic droit > « Exécuter en tant qu'administrateur » fonctionne aussi.
+    uac_admin=False,
     upx=False,                   # UPX augmente les faux positifs des antivirus
     disable_windowed_traceback=False,
     runtime_tmpdir=None,

@@ -30,5 +30,28 @@ $work = Join-Path $env:TEMP 'NPone29Cleaner-build'
 if ($LASTEXITCODE -ne 0) { throw 'La compilation a échoué.' }
 
 $exe = Get-Item 'dist\NPone29Cleaner.exe'
+
+# Installateur (Inno Setup 6) : dist\NPone29Cleaner-Setup-<version>.exe
+$version = (Select-String -Path 'app\config.py' -Pattern '^APP_VERSION = "(.+)"').Matches[0].Groups[1].Value
+$iscc = @(
+    (Join-Path $env:LOCALAPPDATA 'Programs\Inno Setup 6\ISCC.exe'),
+    (Join-Path ${env:ProgramFiles(x86)} 'Inno Setup 6\ISCC.exe'),
+    (Join-Path $env:ProgramFiles 'Inno Setup 6\ISCC.exe')
+) | Where-Object { Test-Path $_ } | Select-Object -First 1
+if (-not $iscc) { $iscc = (Get-Command ISCC.exe -ErrorAction SilentlyContinue).Source }
+$setup = $null
+if ($iscc) {
+    Write-Host "> Création de l'installateur (version $version)..."
+    & $iscc /Q "/DAppVersion=$version" 'installer\NPone29Cleaner.iss'
+    if ($LASTEXITCODE -ne 0) { throw "La création de l'installateur a échoué." }
+    $setup = Get-Item "dist\NPone29Cleaner-Setup-$version.exe"
+}
+
 Write-Host ''
-Write-Host ("OK : {0} ({1:N1} Mo)" -f $exe.FullName, ($exe.Length / 1MB)) -ForegroundColor Green
+Write-Host ("OK : {0} ({1:N1} Mo)  -> version portable" -f $exe.FullName, ($exe.Length / 1MB)) -ForegroundColor Green
+if ($setup) {
+    Write-Host ("OK : {0} ({1:N1} Mo)  -> installateur" -f $setup.FullName, ($setup.Length / 1MB)) -ForegroundColor Green
+} else {
+    Write-Host "Installateur non créé : installez Inno Setup 6 (winget install JRSoftware.InnoSetup), puis relancez." `
+        -ForegroundColor Yellow
+}

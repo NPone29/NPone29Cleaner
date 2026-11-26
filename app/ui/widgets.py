@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import sys
 import tkinter as tk
 import tkinter.font as tkfont
 import weakref
@@ -14,6 +15,47 @@ from app.ui import theme
 
 CHECKED = "☑"
 UNCHECKED = "☐"
+
+# --------------------------------------------------------------------------- défilement à la molette
+
+SCROLL_PIXELS = 100     # par cran de molette, comme un navigateur (CustomTkinter : 20 pixels seulement)
+
+
+def wheel_pixels(delta: int, scaling: float = 1.0) -> int:
+    """Pixels à faire défiler pour un évènement molette Windows (`delta` = ±120 par cran, plus fin sur pavé)."""
+    pixels = round(-delta / 120 * SCROLL_PIXELS * scaling)
+    if pixels == 0 and delta:
+        pixels = -1 if delta > 0 else 1
+    return int(pixels)
+
+
+def _table_scrolls_itself(widget) -> bool:
+    """Un tableau qui a sa propre barre de défilement défile seul : la page ne bouge pas en même temps."""
+    return isinstance(widget, ttk.Treeview) and tuple(widget.yview()) != (0.0, 1.0)
+
+
+def install_fast_scrolling() -> None:
+    """Défilement plus rapide des zones déroulantes (CTkScrollableFrame) sous Windows."""
+    cls = ctk.CTkScrollableFrame
+    if getattr(cls, "_npone29_fast_scroll", False) or not sys.platform.startswith("win"):
+        return
+    original = cls._mouse_wheel_all
+
+    def mouse_wheel_all(self, event):
+        try:
+            if not self._check_if_valid_scroll(event.widget) or _table_scrolls_itself(event.widget):
+                return
+            pixels = wheel_pixels(event.delta, ctk.ScalingTracker.get_widget_scaling(self))
+            if self._shift_pressed:
+                if self._parent_canvas.xview() != (0.0, 1.0):
+                    self._parent_canvas.xview("scroll", pixels, "units")
+            elif self._parent_canvas.yview() != (0.0, 1.0):
+                self._parent_canvas.yview("scroll", pixels, "units")
+        except Exception:     # ne jamais casser la molette : comportement d'origine
+            original(self, event)
+
+    cls._mouse_wheel_all = mouse_wheel_all
+    cls._npone29_fast_scroll = True
 
 
 def neutral_button(master, text: str, command: Callable | None = None, width: int = 140, **kw) -> ctk.CTkButton:
