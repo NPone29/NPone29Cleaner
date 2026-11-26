@@ -24,6 +24,10 @@ DEFAULTS: dict[str, Any] = {
     "backup_mode": "incremental",    # full | differential | incremental
     "backup_keep_full": 0,           # 0 = tout garder
     "backup_last": {},               # dernière sauvegarde réussie (date, type, destination)
+    "backup_auto": False,            # sauvegarde automatique (tâche planifiée Windows)
+    "backup_auto_hours": 24,         # fréquence en heures (1, 2, 4, 6, 12, 24, 168)
+    "backup_auto_mode": "incremental",
+    "backup_auto_full_weeks": 0,     # une complète toutes les N semaines (0 = jamais)
 }
 
 

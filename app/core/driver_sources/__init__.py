@@ -11,7 +11,8 @@ import logging
 from app.core.driver_sources.base import (LINK_ORDER, PREFILLED, DeviceRef, DownloadLink, DriverSource, SourceRun,
                                           SystemContext, VendorCheck)
 from app.core.driver_sources.boards import board_sources
-from app.core.driver_sources.chipmakers import AmdSource, IntelSource, OtherVendorSource
+from app.core.driver_sources.chipmakers import AmdSource, OtherVendorSource
+from app.core.driver_sources.intel_dsa import IntelSource
 from app.core.driver_sources.dell import DellSource
 from app.core.driver_sources.hp import HpSource
 from app.core.driver_sources.lenovo import LenovoSource

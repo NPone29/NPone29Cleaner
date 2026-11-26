@@ -8,7 +8,7 @@ import threading
 import customtkinter as ctk
 
 from app.core import software
-from app.core.software import SoftwareUpdate
+from app.core.software import LiveStatus, SoftwareUpdate
 from app.utils.system import RC_CANCELLED, RC_TIMEOUT, CommandResult
 from app.ui import theme
 from app.ui.pages.base import Page
@@ -29,10 +29,14 @@ class SoftwarePage(Page):
         self.busy = False
         self.cancel = threading.Event()     # tout arrêter
         self.skip = threading.Event()       # passer la mise à jour en cours
+        self._current: SoftwareUpdate | None = None   # mise à jour suivie en direct
+        self._position = (0, 0)                       # (index, total) de la mise à jour en cours
+        self._logged = 0                              # messages winget déjà écrits dans le journal
+        self._window: int | None = None               # fenêtre de l'installateur à afficher
 
         self.grid_columnconfigure(0, weight=1)
-        self.grid_rowconfigure(3, weight=3)
-        self.grid_rowconfigure(4, weight=1)
+        self.grid_rowconfigure(4, weight=3)
+        self.grid_rowconfigure(5, weight=1)
 
         PageHeader(self, "Logiciels",
                    "Mettez à jour vos applications en un clic grâce à winget, le gestionnaire de paquets "
@@ -57,16 +61,18 @@ class SoftwarePage(Page):
             ("available", "Nouvelle version", 140, "w", False),
             ("status", "État", 150, "w", False),
         ], checkable=True)
-        self.table.grid(row=3, column=0, sticky="nsew")
+        self.table.grid(row=4, column=0, sticky="nsew")
+
+        self._build_live_card()
 
         self.log = ctk.CTkTextbox(self, height=110, font=("Consolas", 11), fg_color=theme.CARD,
                                   border_width=1, border_color=theme.CARD_BORDER, corner_radius=10)
-        self.log.grid(row=4, column=0, sticky="nsew", pady=(10, 0))
+        self.log.grid(row=5, column=0, sticky="nsew", pady=(10, 0))
         self.log.insert("end", "Le journal des mises à jour s'affichera ici.\n")
         self.log.configure(state="disabled")
 
         self.status = StatusLine(self)
-        self.status.grid(row=5, column=0, sticky="ew", pady=(10, 0))
+        self.status.grid(row=6, column=0, sticky="ew", pady=(10, 0))
 
         if software.winget_path():
             self.status.set_text("Cliquez sur « Rechercher » pour lister les logiciels à mettre à jour.")
@@ -76,6 +82,98 @@ class SoftwarePage(Page):
             neutral_button(bar, "Installer winget ↗",
                            lambda: open_url("https://apps.microsoft.com/detail/9NBLGGH4NNS1"), width=10) \
                 .pack(side="right")
+
+    # ------------------------------------------------------------------ suivi en direct
+    def _build_live_card(self) -> None:
+        """Carte affichée pendant une mise à jour : étape, téléchargement, activité de l'installateur."""
+        card = self.live = ctk.CTkFrame(self, fg_color=theme.CARD, border_width=1, border_color=theme.CARD_BORDER,
+                                        corner_radius=10)
+        card.grid_columnconfigure(0, weight=1)
+        self.live_title = ctk.CTkLabel(card, text="", font=theme.font(14, "bold"), anchor="w")
+        self.live_title.grid(row=0, column=0, sticky="w", padx=14, pady=(10, 0))
+        self.live_clock = ctk.CTkLabel(card, text="", font=theme.font(12), text_color=theme.MUTED, anchor="e")
+        self.live_clock.grid(row=0, column=1, sticky="e", padx=14, pady=(10, 0))
+        self.live_bar = ctk.CTkProgressBar(card, height=8)
+        self.live_bar.grid(row=1, column=0, columnspan=2, sticky="ew", padx=14, pady=(8, 6))
+        self.live_bar.set(0)
+        self._bar_mode = ""
+        self.live_step = ctk.CTkLabel(card, text="", font=theme.font(12), anchor="w", justify="left",
+                                      wraplength=900)
+        self.live_step.grid(row=2, column=0, columnspan=2, sticky="w", padx=14)
+        self.live_activity = ctk.CTkLabel(card, text="", font=theme.font(12), anchor="w", justify="left",
+                                          wraplength=760)
+        self.live_activity.grid(row=3, column=0, sticky="w", padx=14, pady=(2, 10))
+        self.window_btn = neutral_button(card, "Afficher la fenêtre", self._show_window, width=10)
+
+    def _live_bar(self, fraction: float | None) -> None:
+        """Barre de la mise à jour en cours : avancement réel si connu, sinon animation « en cours »."""
+        if fraction is None:
+            if self._bar_mode != "indeterminate":
+                self.live_bar.configure(mode="indeterminate")
+                self.live_bar.start()
+                self._bar_mode = "indeterminate"
+            return
+        if self._bar_mode != "determinate":
+            self.live_bar.stop()
+            self.live_bar.configure(mode="determinate")
+            self._bar_mode = "determinate"
+        self.live_bar.set(fraction)
+
+    def _show_live(self, item: SoftwareUpdate, index: int, total: int) -> None:
+        self._current, self._position, self._logged, self._window = item, (index, total), 0, None
+        self.live_title.configure(text=f"{item.name}  ·  {item.version} → {item.available}  ({index + 1}/{total})")
+        self.live_clock.configure(text="0 s")
+        self.live_step.configure(text="Démarrage de winget…")
+        self.live_activity.configure(text="", text_color=theme.MUTED)
+        self.window_btn.grid_forget()
+        self._live_bar(None)
+        self.live.grid(row=3, column=0, sticky="ew", pady=(0, 10))
+
+    def _hide_live(self) -> None:
+        self._current = None
+        self.live_bar.stop()
+        self._bar_mode = ""
+        self.live.grid_forget()
+
+    def _on_live(self, item: SoftwareUpdate, status: LiveStatus) -> None:
+        if self._current is None or item.id != self._current.id:
+            return     # état arrivé après la fin de cette mise à jour
+        step, activity, level = software.describe(status)
+        self.live_clock.configure(text=software.clock_text(status.elapsed))
+        self.live_step.configure(text=step)
+        color = {"ok": theme.SUCCESS, "warning": theme.WARNING}.get(level, theme.MUTED)
+        icon = {"ok": "● ", "warning": "⚠ "}.get(level, "◌ ")
+        self.live_activity.configure(text=icon + activity, text_color=color)
+        self._live_bar(status.fraction if status.downloading else None)
+
+        self._window = status.windows[0][0] if status.windows else None
+        if self._window:
+            self.window_btn.grid(row=3, column=1, sticky="e", padx=14, pady=(2, 10))
+        else:
+            self.window_btn.grid_forget()
+
+        if status.downloading:
+            state = (f"Téléchargement {status.fraction * 100:.0f} %" if status.fraction is not None
+                     else "Téléchargement…")
+        elif status.stalled:
+            state = "⚠ Sans activité"
+        elif status.downloaded:
+            state = "Installation…"
+        else:
+            state = "En cours…"
+        self.table.update_row(item.id, [item.name, item.id, item.version, item.available, state])
+
+        index, total = self._position
+        part = (status.fraction or 0) * 0.5 if status.downloading else (0.5 if status.downloaded else 0)
+        self.status.progress((index + part) / total,
+                             f"Mise à jour {index + 1}/{total} : {item.name} — {software.clock_text(status.elapsed)}")
+        for message in status.messages[self._logged:]:
+            self._write_log(f"   {message}")
+        self._logged = max(self._logged, len(status.messages))
+
+    def _show_window(self) -> None:
+        if not (self._window and software.bring_to_front(self._window)):
+            self.status.set_text("Impossible d'afficher la fenêtre : cherchez-la dans la barre des tâches.")
 
     def _write_log(self, text: str) -> None:
         self.log.configure(state="normal")
@@ -159,6 +257,7 @@ class SoftwarePage(Page):
         self.stepper.set(2)
         items = [self.updates[i] for i in ids if i in self.updates]
         progress = self.dispatcher.wrap(self._on_progress)
+        live = self.dispatcher.wrap(self._on_live)
         cancel, skip = self.cancel, self.skip
 
         def work() -> tuple[int, int, int]:
@@ -170,7 +269,8 @@ class SoftwarePage(Page):
                 progress(index, len(items), item, None)
                 # Une mise à jour en erreur ne doit jamais bloquer les suivantes.
                 try:
-                    result = software.upgrade(item, cancel=skip)
+                    result = software.upgrade(item, cancel=skip,
+                                              on_status=lambda status, it=item: live(it, status))
                 except Exception as exc:
                     log.exception("Mise à jour de %s impossible", item.id)
                     result = CommandResult(-1, "", str(exc) or exc.__class__.__name__)
@@ -189,11 +289,16 @@ class SoftwarePage(Page):
     def _on_progress(self, done: int, total: int, item: SoftwareUpdate, result) -> None:
         row = [item.name, item.id, item.version, item.available]
         if result is None:
-            self.status.progress(done / total, f"Mise à jour ({done + 1}/{total}) : {item.name}… "
-                                               "(bloquée ? cliquez sur « Passer celui-ci »)")
+            self.status.progress(done / total, f"Mise à jour {done + 1}/{total} : {item.name}")
             self.table.update_row(item.id, row + ["En cours…"])
             self._write_log(f"▶ {item.name} ({item.version} → {item.available})")
+            self._show_live(item, done, total)
             return
+        # Messages de winget arrivés depuis le dernier rafraîchissement (ou commande trop courte pour un suivi).
+        if self._current is not None and self._current.id == item.id:
+            for message in software.output_messages(result.output)[self._logged:]:
+                self._write_log(f"   {message}")
+            self._current = None
         if result.ok:
             self.table.update_row(item.id, row + ["✓ À jour"], tags=("ok",))
             self.table.set_checked([item.id], False)
@@ -205,15 +310,15 @@ class SoftwarePage(Page):
             return
         label = "✗ Délai dépassé" if result.returncode == RC_TIMEOUT else f"✗ Échec ({result.returncode})"
         self.table.update_row(item.id, row + [label], tags=("error",))
-        last = [l for l in result.output.splitlines() if l.strip()][-3:]
-        for line in last:
-            self._write_log(f"   {line}")
+        self._write_log(f"   {label}")
 
     def _reset_pending_rows(self) -> None:
-        """Remet « Disponible » sur les lignes restées « En cours… » (arrêt ou erreur inattendue)."""
+        """Masque le suivi et remet « Disponible » sur les lignes restées en cours (arrêt ou erreur inattendue)."""
+        self._hide_live()
+        finished = ("✓", "✗", "⏭", "Disponible")
         for item in self.updates.values():
             values = self.table.row_values(item.id)
-            if values and values[-1] == "En cours…":
+            if values and not str(values[-1]).startswith(finished):
                 self.table.update_row(item.id, [item.name, item.id, item.version, item.available, "Disponible"])
 
     def _upgrade_error(self, exc: BaseException) -> None:

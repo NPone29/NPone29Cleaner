@@ -10,10 +10,10 @@ et des logiciels, et les petits outils d'entretien du quotidien.
 | **Tableau de bord** | Infos système, utilisation CPU/RAM en direct, espace disque, accès à l'entretien guidé. |
 | **Entretien guidé** | Assistant en 5 étapes (fichiers inutiles → nettoyage → pilotes → logiciels → démarrage) qui demande l'accord de l'utilisateur avant chaque action et termine par un bilan. |
 | **Mon PC** | Carte interactive du matériel (processeur, mémoire et emplacements libres, carte graphique, disques, réseau, audio, écran, ventilation, batterie) avec explications simples, caractéristiques, conseils et températures en direct. Bouton « Copier la configuration ». |
-| **Sauvegarde** | Copie les dossiers choisis (Documents, Bureau, Images… ou tout autre dossier) sur un disque externe, une clé USB ou un dossier réseau. Sauvegarde **complète**, **différentielle** ou **incrémentale**, au choix. Les fichiers sont copiés **en clair** et restent lisibles directement depuis le disque, même sans l'application. Onglet Restaurer : restauration exacte à la date choisie (dans un dossier ou à l'emplacement d'origine), recherche d'un fichier, ouverture directe, vérification, suppression des anciennes sauvegardes. Prévient si la destination est sur le même disque physique que les données. |
+| **Sauvegarde** | Copie les dossiers choisis (Documents, Bureau, Images… ou tout autre dossier) sur un disque externe, une clé USB ou un dossier réseau. Sauvegarde **complète**, **différentielle** ou **incrémentale**, au choix. Les fichiers sont copiés **en clair** et restent lisibles directement depuis le disque, même sans l'application. Onglet Restaurer : restauration exacte à la date choisie (dans un dossier ou à l'emplacement d'origine), recherche d'un fichier, ouverture directe, vérification, suppression des anciennes sauvegardes. Prévient si la destination est sur le même disque physique que les données. **Sauvegarde automatique** en arrière-plan, même application fermée : toutes les heures, toutes les 2, 4, 6 ou 12 heures, chaque jour ou chaque semaine, avec le type choisi (et, en option, une complète toutes les N semaines). Si le PC est éteint ou le disque débranché, elle se fait dès que possible ; notification Windows à la fin, rappel si le disque n'a pas été branché depuis 7 jours. |
 | **Nettoyage** | Analyse puis supprime : corbeille, fichiers temporaires, miniatures, rapports de plantage, cache Windows Update, Delivery Optimization, shaders DirectX/NVIDIA/AMD, journaux, caches de Chrome / Edge / Brave / Vivaldi / Opera / Firefox, Discord, Steam, Teams, Spotify, VS Code, pip, npm. Prévient si un navigateur ouvert bloque une partie du nettoyage, puis affiche un bilan (espace libre avant → après). |
-| **Pilotes** | **Analyse complète** de chaque périphérique avec trois états honnêtes : **À jour (vérifié)**, **Mise à jour disponible**, **Non vérifiable**. Un pilote n'est jamais affiché « à jour » sans source fiable : Windows Update, le **Catalogue Microsoft Update** (pilotes Intel, Realtek, Killer, Acer… publiés pour l'identifiant exact du matériel, classés selon les règles de Windows), nvidia.com (cartes NVIDIA) ou le catalogue officiel du fabricant pour les PC **Dell**, **HP** et **Lenovo**. Chaque ligne indique la source utilisée et la date de la vérification. Bouton **Télécharger** vers la page la plus précise : fichier ou page exacte du pilote quand la source la fournit, sinon page de support pré-remplie (modèle du PC / de la carte mère, ID matériel dans le Catalogue Microsoft). Quand aucune source ne connaît un pilote, l'interface le dit au lieu de deviner. Installation automatique via Windows Update, depuis le Catalogue Microsoft (empreinte SHA-256 et signature Microsoft vérifiées, puis `pnputil`) ou de l'installateur NVIDIA officiel (signature vérifiée). **La liste s'actualise toute seule** après chaque installation (et à la fermeture de l'installateur NVIDIA). Point de restauration automatique, inventaire, périphériques en erreur. |
-| **Logiciels** | Liste les logiciels à mettre à jour et les met à jour en silence via **winget**. |
+| **Pilotes** | **Analyse complète** de chaque périphérique avec trois états honnêtes : **À jour (vérifié)**, **Mise à jour disponible**, **Non vérifiable**. Un pilote n'est jamais affiché « à jour » sans source fiable : Windows Update, le **Catalogue Microsoft Update** (pilotes Intel, Realtek, Killer, Acer… publiés pour l'identifiant exact du matériel, classés selon les règles de Windows), la **liste officielle d'Intel** (celle de son outil Intel Driver & Support Assistant : cartes graphiques Intel / Arc, Wi-Fi, Bluetooth, Ethernet, Killer), nvidia.com (cartes NVIDIA) ou le catalogue officiel du fabricant pour les PC **Dell**, **HP** et **Lenovo**. Chaque ligne indique la source utilisée et la date de la vérification. Bouton **Télécharger** vers la page la plus précise : fichier ou page exacte du pilote quand la source la fournit, sinon page de support pré-remplie (modèle du PC / de la carte mère, ID matériel dans le Catalogue Microsoft). Quand aucune source ne connaît un pilote, l'interface le dit au lieu de deviner. Installation automatique via Windows Update, depuis le Catalogue Microsoft (empreinte SHA-256 et signature Microsoft vérifiées, puis `pnputil`) ou des installateurs officiels NVIDIA et Intel (empreinte et signature vérifiées, lancés l'un après l'autre). **La liste s'actualise toute seule** après chaque installation (et à la fermeture de chaque installateur). Point de restauration automatique, inventaire, périphériques en erreur. |
+| **Logiciels** | Liste les logiciels à mettre à jour et les met à jour en silence via **winget**, avec un **suivi en direct** : étape en cours, téléchargement (Mo reçus, %, débit), activité de l'installateur, temps écoulé, alerte s'il ne se passe plus rien depuis 1 min 30 et bouton pour afficher une fenêtre d'installateur restée en arrière-plan. |
 | **Démarrage** | Active/désactive les programmes lancés au démarrage (même mécanisme que le Gestionnaire des tâches, 100 % réversible). |
 | **Désinstallation** | Liste des programmes installés, recherche, désinstallation via le désinstalleur officiel. |
 | **Gros fichiers** | Trouve les plus gros fichiers d'un dossier ; suppression vers la corbeille. |
@@ -37,6 +37,15 @@ Thème sombre / clair / système, réglages mémorisés dans `%APPDATA%\NPone29C
 - Les pilotes installés automatiquement viennent de Windows Update ou du site officiel du fabricant
   (NVIDIA : téléchargement HTTPS limité aux domaines `*.nvidia.com` + vérification de la signature numérique
   « NVIDIA Corporation » avant le lancement). Aucun site de pilotes tiers.
+- Intel : la liste publique de l'outil Intel Driver & Support Assistant (`dsadata.intel.com/data/en`, archive
+  ZIP) est téléchargée en entier, puis comparée sur le PC ; **seul** son fichier `software-configurations.json`
+  est lu (les bibliothèques de l'outil Intel qu'elle contient ne sont ni extraites ni exécutées). Un pilote est
+  proposé s'il déclare l'identifiant du périphérique (jokers d'Intel compris), s'il est prévu pour cette version
+  de Windows, n'est ni bêta ni réservé à une carte mère ou un produit Intel précis, et si sa version est plus
+  récente. Installateur téléchargé en HTTPS depuis `downloadmirror.intel.com` uniquement, empreinte SHA-1
+  comparée à celle publiée par Intel, signature « Intel Corporation » vérifiée avant le lancement. Si Windows
+  garde malgré tout le pilote du fabricant du PC après une installation réussie, la même version n'est plus
+  reproposée.
 - Catalogue Microsoft Update : recherche par identifiant de puce sur `www.catalog.update.microsoft.com`,
   fichier téléchargé en HTTPS depuis `*.download.windowsupdate.com`, empreinte SHA-256 comparée à celle
   annoncée par Microsoft et signature « Microsoft Corporation » vérifiée avant l'installation (`pnputil`).
@@ -58,7 +67,7 @@ Thème sombre / clair / système, réglages mémorisés dans `%APPDATA%\NPone29C
   et le type de machine Lenovo (ex. `20XW`) dans l'adresse du catalogue. Le catalogue Dell est téléchargé en
   entier et filtré sur le PC avec l'identifiant de modèle (SKU). **Jamais** de numéro de série ni de service
   tag. L'inventaire « Mon PC » reste sur le PC.
-- Les catalogues sont gardés 24 h dans `%LOCALAPPDATA%\NPone29Cleaner\cache\drivers` (Catalogue Microsoft :
+- Les catalogues sont gardés 24 h (liste Intel comprise) dans `%LOCALAPPDATA%\NPone29Cleaner\cache\drivers` (Catalogue Microsoft :
   recherches 12 h, fiches des pilotes 60 jours).
 - PC Dell : la version d'un paquet Dell n'est souvent pas celle du pilote qu'il installe (paquet Intel Ethernet
   20.0.3.28 → pilote 12.19.2.66). L'application lit donc, sur le PC uniquement, les journaux des paquets Dell
@@ -89,6 +98,27 @@ Thème sombre / clair / système, réglages mémorisés dans `%APPDATA%\NPone29C
   fichiers OneDrive « disponibles en ligne uniquement » (déjà dans le cloud).
 - Les fichiers ouverts en écriture par un programme (ex. fichier `.pst` d'Outlook ouvert) ne peuvent pas être
   copiés : ils sont listés à la fin et l'ancienne copie éventuelle est conservée.
+
+### Sauvegarde automatique
+
+- Activée depuis la page Sauvegarde (étape 4), qui crée la tâche « NPone29 Cleaner - Sauvegarde » du
+  Planificateur de tâches Windows (application lancée **en administrateur**, une seule fois). Désactiver la
+  sauvegarde automatique supprime la tâche.
+- La tâche lance `NPone29Cleaner.exe --backup` à l'ouverture de session puis **toutes les heures**, sans
+  fenêtre. Ce mode relit les réglages à chaque fois (dossiers, destination, type, conservation : rien à
+  recréer quand ils changent) et ne fait rien si la sauvegarde n'est pas encore due, si le disque est absent
+  ou si une autre sauvegarde est en cours (verrou partagé avec la sauvegarde manuelle).
+- Une heure manquée (PC éteint) est rattrapée au démarrage ; aucune restriction sur batterie. La tâche
+  s'exécute dans la session de l'utilisateur avec les droits les plus élevés (le .exe les demande).
+- Résultat dans `%APPDATA%\NPone29Cleaner\backup_status.json` (dernier essai, dernier succès, « disque absent
+  depuis »…), affiché dans la page. Notification Windows : succès, fichiers non copiés, échec (une même erreur
+  au plus une fois par jour), disque absent depuis 7 jours (au plus un rappel par jour). Code de sortie 1 en
+  cas d'échec.
+- Lecteur réseau : une tâche avec droits administrateur ne voit pas les lettres de lecteurs réseau (`Z:`) ;
+  l'application propose de les remplacer par le chemin réseau complet (`\\NAS\partage`).
+- Si l'application est déplacée, la page le détecte et propose de réparer la tâche.
+- Test manuel : `NPone29Cleaner.exe --backup --force` (ou `python main.py --backup --force`) sauvegarde tout de
+  suite, même si la sauvegarde n'est pas due.
 
 ## Lancer en développement
 
@@ -148,16 +178,19 @@ app/
       nvidia_source.py       nvidia.com
       microsoft_catalog.py   Catalogue Microsoft Update (tous fabricants, règles de classement de Windows)
       dell.py, hp.py, lenovo.py   catalogues officiels des PC de marque
-      chipmakers.py          Intel, AMD, autres fabricants de puces (liens seuls)
+      intel_dsa.py           Intel (liste publique d'Intel Driver & Support Assistant)
+      chipmakers.py          AMD, autres fabricants de puces (liens seuls)
       boards.py              ASUS, MSI, Gigabyte, ASRock, Acer… (pages support, liens seuls)
     vendors.py             identifiants fabricants (VEN/VID) -> nom, site, liens de recherche
     nvidia.py              nvidia-smi (températures) + dernier pilote sur nvidia.com
     hardware.py            inventaire « Mon PC » + conseils
-    software.py            winget
+    software.py            winget (recherche, mise à jour, suivi en direct)
     startup.py             programmes au démarrage
     uninstaller.py         programmes installés
     bigfiles.py            recherche des gros fichiers
     backup.py              sauvegarde complète/différentielle/incrémentale, restauration, vérification
+    backup_schedule.py     sauvegarde automatique : échéance, tâche planifiée, verrou, mode --backup
+    packages.py            installateurs officiels (NVIDIA, Intel) : téléchargement, empreinte, signature
     maintenance.py         outils (DNS, SFC, DISM…)
     sysinfo.py             infos système
   ui/                    Interface CustomTkinter
@@ -183,11 +216,18 @@ elle apparaît automatiquement dans l'interface.
 - La vitesse des ventilateurs du processeur et du boîtier n'est pas accessible depuis Windows sur la plupart
   des PC (seuls ceux de la carte graphique NVIDIA le sont, via `nvidia-smi`) : la page « Mon PC » oriente
   vers l'outil du fabricant de la carte mère.
-- La vérification « chez le fabricant » est automatique pour NVIDIA et pour les PC Dell, HP et Lenovo. Pour
-  Intel, AMD, Realtek, Acer, etc., c'est le Catalogue Microsoft Update qui sert de référence : il contient les
-  pilotes publiés pour Windows, mais pas toujours les toutes dernières versions génériques du site du
-  fabricant de la puce (Intel, AMD…). Un pilote absent du catalogue reste « Non vérifiable » et l'application
-  ouvre la bonne page officielle.
+- La vérification « chez le fabricant » est automatique pour NVIDIA, Intel (cartes graphiques, Wi-Fi,
+  Bluetooth, Ethernet : Intel ne publie dans la liste de son outil ni le chipset, ni l'audio, ni le stockage)
+  et pour les PC Dell, HP et Lenovo. Pour AMD, Realtek, Acer, ASUS, MSI, etc., c'est le Catalogue Microsoft
+  Update qui sert de référence : il contient les pilotes publiés pour Windows, mais pas toujours les toutes
+  dernières versions génériques du site du fabricant de la puce (AMD…). AMD ne publie aucune liste exploitable ;
+  ASUS, MSI, Gigabyte et ASRock n'ont que des listes par modèle, sans identifiant matériel, donc impossibles à
+  relier de façon fiable à un périphérique. Un pilote absent de toutes les sources reste « Non vérifiable » et
+  l'application ouvre la bonne page officielle.
+- La liste d'Intel n'est pas une API documentée : c'est celle que télécharge l'outil officiel d'Intel. Si Intel
+  en change le format, la source Intel est simplement ignorée (les autres sources continuent).
+- Pilotes Intel génériques : sur certains PC portables, le fabricant du PC recommande sa propre version du
+  pilote graphique ; l'application le signale.
 - Le catalogue n'a pas d'API officielle : l'application lit ses pages web (première page de résultats, 25
   lignes par recherche). Pour une puce très répandue (ex. Intel UHD), la recherche sans SUBSYS est dominée par
   les pilotes d'autres marques de PC : la recherche avec l'identifiant exact du PC est donc faite en premier.
@@ -201,9 +241,10 @@ elle apparaît automatiquement dans l'interface.
 
 ## Pistes pour la suite
 
-- Vérification en ligne pour d'autres fabricants (AMD, Intel) si un service officiel apparaît
+- Vérification en ligne pour d'autres fabricants (AMD) si un service officiel apparaît
 - Recherche de fichiers en double
-- Nettoyage et sauvegarde planifiés (tâche Windows)
+- Nettoyage planifié (tâche Windows)
+- État de la sauvegarde automatique sur le Tableau de bord
 - Sauvegarde des fichiers ouverts (clichés instantanés VSS, droits administrateur)
 - Installeur (Inno Setup) et signature de l'exe
 - Mise à jour automatique de l'application elle-même
