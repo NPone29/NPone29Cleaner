@@ -105,7 +105,10 @@ def list_upgrades() -> list[SoftwareUpdate]:
     return updates
 
 
-UPGRADE_TIMEOUT = 20 * 60   # au-delà, l'installateur est considéré comme bloqué
+# Garde-fou seulement : l'installateur est arrêté de force à l'échéance, ce qui peut laisser le logiciel à moitié
+# mis à jour. Les grosses mises à jour (Visual Studio, Office…) peuvent durer bien plus de 20 min sur un PC lent ;
+# un blocage réel est signalé bien avant (IDLE_WARNING) et l'utilisateur peut passer au suivant.
+UPGRADE_TIMEOUT = 2 * 60 * 60
 IDLE_WARNING = 90           # secondes sans aucune activité avant de signaler un blocage possible
 
 _URL = re.compile(r"https?://[^\s\"'<>]+")

@@ -64,6 +64,34 @@ class VendorPackage:
         return human_size(self.size) if self.size else "taille inconnue"
 
 
+def version_in_place(package: VendorPackage, device_ids: list[str], checks: int = 3, delay: float = 2.0) -> str:
+    """Version du pilote désormais utilisée par l'un de ces périphériques si elle atteint celle du paquet, sinon "".
+
+    Le code de sortie d'un installateur ne suffit pas : le lanceur auto-extractible du pilote graphique Intel,
+    par exemple, ne renvoie pas 0 alors que l'installation a réussi. Ce qui compte, c'est le pilote en place.
+    """
+    import time
+
+    from app.core import drivers
+    from app.core.driver_sources.base import compare_versions
+
+    ids = [d for d in device_ids if d]
+    if not ids or not package.version:
+        return ""
+    for attempt in range(checks):
+        try:
+            now = drivers.driver_version_of(ids)
+        except Exception:
+            log.warning("Version installée illisible après %s", package.title, exc_info=True)
+            now = {}
+        for version, _date in now.values():
+            if version.strip() == package.version.strip() or compare_versions(version, package.version) in (0, 1):
+                return version
+        if attempt < checks - 1:
+            time.sleep(delay)
+    return ""
+
+
 def file_hash(path: Path, algorithm: str) -> str:
     digest = hashlib.new(algorithm)
     with open(path, "rb") as fh:

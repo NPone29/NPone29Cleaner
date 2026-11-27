@@ -223,6 +223,15 @@ def _query_installed_drivers() -> list[InstalledDriver]:
             device_id=_str(row.DeviceID),
             hardware_id=_str(row.HardWareID),
         ))
+    # WMI (Win32_PnPSignedDriver) garde un moment l'ancienne version après une installation : le registre, lui,
+    # indique tout de suite le pilote réellement associé au périphérique.
+    actual = read_driver_info([d.device_id for d in found])
+    for d in found:
+        info = actual.get(d.device_id.lower())
+        if info and info[0]:
+            d.version = info[0]
+            d.date = info[1] or d.date
+            d.inf_name = info[2] or d.inf_name
     found.sort(key=lambda d: d.device_name.lower())
     return found
 
@@ -310,11 +319,57 @@ def read_device_ids(instance_ids: list[str]) -> dict[str, DeviceIds]:
     return found
 
 
+def read_driver_info(instance_ids: list[str]) -> dict[str, tuple[str, datetime | None, str]]:
+    """(version, date, INF) du pilote associé à chaque périphérique, lus dans le registre (sans droits
+    administrateur). À jour dès la fin de l'installation, contrairement à WMI. Clé : identifiant en minuscules."""
+    try:
+        import winreg
+    except ImportError:  # hors Windows
+        return {}
+
+    def read(key, name) -> str:
+        try:
+            return str(winreg.QueryValueEx(key, name)[0] or "")
+        except OSError:
+            return ""
+
+    found: dict[str, tuple[str, datetime | None, str]] = {}
+    for instance in instance_ids:
+        if not instance or instance.lower() in found:
+            continue
+        try:
+            with winreg.OpenKey(winreg.HKEY_LOCAL_MACHINE, _ENUM_KEY + instance) as key:
+                driver_key = read(key, "Driver")
+            if not driver_key:
+                continue
+            with winreg.OpenKey(winreg.HKEY_LOCAL_MACHINE, _CLASS_KEY + driver_key) as key:
+                version, date, inf = read(key, "DriverVersion"), read(key, "DriverDate"), read(key, "InfPath")
+        except OSError:
+            continue
+        found[instance.lower()] = (version.strip(), _registry_date(date), inf.strip())
+    return found
+
+
+def _registry_date(text: str) -> datetime | None:
+    """« 7-4-2026 » (mois-jour-année, format du registre des pilotes) -> datetime."""
+    try:
+        month, day, year = (int(p) for p in text.strip().split("-"))
+        return datetime(year, month, day)
+    except (ValueError, TypeError):
+        return None
+
+
 def driver_version_of(device_ids: list[str]) -> dict[str, tuple[str, datetime | None]]:
-    """Version et date du pilote actuellement utilisé par ces périphériques (après une installation)."""
+    """Version et date du pilote actuellement utilisé par ces périphériques (après une installation).
+
+    Lu dans le registre, à jour immédiatement ; WMI seulement pour les périphériques illisibles.
+    """
     wanted = {d.lower() for d in device_ids if d}
-    return {d.device_id.lower(): (d.version, d.date) for d in list_installed_drivers()
-            if d.device_id.lower() in wanted}
+    found = {k: (v[0], v[1]) for k, v in read_driver_info(list(wanted)).items() if v[0]}
+    if wanted - set(found):
+        found.update({d.device_id.lower(): (d.version, d.date) for d in list_installed_drivers()
+                      if d.device_id.lower() in wanted - set(found)})
+    return found
 
 
 @dataclass
@@ -392,10 +447,8 @@ class WindowsUpdateDriverService:
     SEARCH_CRITERIA = "IsInstalled=0 and Type='Driver' and IsHidden=0"
 
     def __init__(self) -> None:
-        self._generation = 0      # incrémenté quand une installation bloquée est abandonnée
         self._executor = self._new_executor()
-        self._session = None
-        self._updates: dict[str, object] = {}  # objets COM, utilisés uniquement dans le thread dédié
+        self._state = _WuState()   # session et objets COM du thread courant (remplacés par `abandon`)
         self.last_results: list[DriverUpdate] | None = None  # dernière recherche (lecture seule)
 
     @staticmethod
@@ -409,19 +462,18 @@ class WindowsUpdateDriverService:
         """Abandonne une opération bloquée (ex. installation qui ne se termine jamais).
 
         L'appel COM en cours ne peut pas être interrompu : on laisse l'ancien thread finir seul et les
-        opérations suivantes passent par un nouveau thread, avec une nouvelle session Windows Update.
+        opérations suivantes passent par un nouveau thread, avec une nouvelle session Windows Update. L'ancien
+        thread garde son propre état (`_WuState`) : il ne peut plus toucher à celui du nouveau.
         """
-        self._generation += 1
         old = self._executor
         self._executor = self._new_executor()
-        self._session = None
-        self._updates = {}
+        self._state = _WuState()
         old.shutdown(wait=False, cancel_futures=True)
         log.warning("Windows Update : opération en cours abandonnée à la demande de l'utilisateur")
 
     # Les méthodes publiques renvoient des Future ; le travail s'exécute dans le thread dédié.
     def search(self) -> Future:
-        return self._executor.submit(self._search)
+        return self._executor.submit(self._search, self._state)
 
     def install(self, update_ids: list[str],
                 progress: Callable[[int, int, str, str], None] | None = None,
@@ -429,30 +481,31 @@ class WindowsUpdateDriverService:
         """`cancel` : évènement qui empêche d'installer les pilotes suivants ; `report` : bilan rempli au fur
         et à mesure (lisible même si l'installation est abandonnée en cours de route)."""
         return self._executor.submit(self._install, list(update_ids), progress, cancel,
-                                     report if report is not None else InstallReport(), self._generation)
+                                     report if report is not None else InstallReport(), self._state)
 
-    def _get_session(self):
-        if self._session is None:
+    @staticmethod
+    def _get_session(state: "_WuState"):
+        if state.session is None:
             import win32com.client  # type: ignore
 
-            self._session = win32com.client.Dispatch("Microsoft.Update.Session")
-            self._session.ClientApplicationID = "NPone29 Cleaner"
-        return self._session
+            state.session = win32com.client.Dispatch("Microsoft.Update.Session")
+            state.session.ClientApplicationID = "NPone29 Cleaner"
+        return state.session
 
-    def _search(self) -> list[DriverUpdate]:
+    def _search(self, state: "_WuState") -> list[DriverUpdate]:
         try:
-            searcher = self._get_session().CreateUpdateSearcher()
+            searcher = self._get_session(state).CreateUpdateSearcher()
             searcher.Online = True
             result = searcher.Search(self.SEARCH_CRITERIA)
         except Exception as exc:
             raise RuntimeError(com_error_message(exc)) from exc
 
-        self._updates.clear()
+        updates: dict[str, object] = {}
         found: list[DriverUpdate] = []
         for i in range(result.Updates.Count):
             upd = result.Updates.Item(i)
             update_id = str(upd.Identity.UpdateID)
-            self._updates[update_id] = upd
+            updates[update_id] = upd
             found.append(DriverUpdate(
                 update_id=update_id,
                 title=_str(_get(upd, "Title", "")),
@@ -466,17 +519,19 @@ class WindowsUpdateDriverService:
                 hardware_id=_str(_get(upd, "DriverHardwareID", "")),
             ))
         log.info("Windows Update : %d pilote(s) disponible(s)", len(found))
-        self.last_results = found
+        state.updates = updates
+        if state is self._state:    # une recherche abandonnée ne remplace pas les résultats affichés
+            self.last_results = found
         return found
 
     def _install(self, update_ids: list[str], progress, cancel, report: InstallReport,
-                 generation: int) -> InstallReport:
+                 state: "_WuState") -> InstallReport:
         import win32com.client  # type: ignore
 
-        if not self._updates:
-            self._search()
-        session = self._get_session()
-        updates = self._updates
+        if any(update_id not in state.updates for update_id in update_ids):
+            self._search(state)
+        session = self._get_session(state)
+        updates = state.updates
         total = len(update_ids)
 
         for index, update_id in enumerate(update_ids, start=1):
@@ -524,13 +579,24 @@ class WindowsUpdateDriverService:
             except Exception as exc:
                 log.exception("Installation du pilote %s impossible", title)
                 report.outcomes.append(InstallOutcome(update_id, title, False, com_error_message(exc)))
+            finally:
+                # Réussi ou non, l'objet n'est plus à jour (téléchargé, contrat accepté…) : une nouvelle tentative
+                # relancera une recherche.
+                updates.pop(update_id, None)
 
-        # Les pilotes installés ne doivent plus apparaître à la prochaine recherche (sauf si cette installation
-        # a été abandonnée entre-temps : l'état appartient alors au nouveau thread).
-        if generation == self._generation:
-            self._updates.clear()
+        # Les pilotes installés ne doivent plus apparaître : la prochaine analyse relance une recherche (sauf si
+        # cette installation a été abandonnée entre-temps : les résultats appartiennent alors au nouveau thread).
+        if state is self._state:
             self.last_results = None
         return report
+
+
+class _WuState:
+    """Session Windows Update et objets COM d'un thread : jamais partagés avec un autre thread."""
+
+    def __init__(self) -> None:
+        self.session = None
+        self.updates: dict[str, object] = {}
 
 
 # --------------------------------------------------------------------------- divers

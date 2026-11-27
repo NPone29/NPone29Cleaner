@@ -239,3 +239,29 @@ def test_nvidia_driver_becomes_package():
     pkg = nv.package()
     assert pkg.publisher == "NVIDIA Corporation" and pkg.size_text == "890 Mo"
     assert pkg.host == "us.download.nvidia.com"
+
+
+def test_zip_only_package_is_offered_as_download_not_auto_install(catalog):
+    """« Wired_driver_31.3_x64.zip » : pas de signature Windows, rien à lancer. L'installation automatique échouait
+    à chaque fois ; on propose le téléchargement à la place."""
+    from dataclasses import replace
+
+    c = best(AX201, catalog)
+    zipped = replace(c, file=replace(c.file, url="https://downloadmirror.intel.com/931390/Wired_driver_31.3_x64.zip"))
+    check = intel_dsa.make_check(AX201, zipped, NOW)
+    assert check.update_available and check.extra is None
+    assert check.download_url.endswith(".zip") and "ZIP" in check.note
+    assert intel_dsa.launchable("https://x/setup.exe") and intel_dsa.launchable("https://x/a.MSI?dl=1")
+    assert not intel_dsa.launchable("https://x/Wired_driver_31.3_x64.zip")
+
+
+def test_installer_result_is_judged_on_the_driver_in_place(monkeypatch):
+    """Pilote graphique Intel du 27/11 : l'installateur renvoie un code inhabituel mais la version est en place."""
+    from app.core import drivers
+
+    pkg = packages.VendorPackage("Intel", "Graphics", "32.0.101.7092", "https://x/gfx.exe", ("x",), "Intel Corporation")
+    monkeypatch.setattr(drivers, "driver_version_of", lambda ids: {r"pci\gpu": ("32.0.101.7092", None)})
+    assert packages.version_in_place(pkg, [r"PCI\GPU"], checks=1) == "32.0.101.7092"
+    monkeypatch.setattr(drivers, "driver_version_of", lambda ids: {r"pci\gpu": ("32.0.101.6000", None)})
+    assert packages.version_in_place(pkg, [r"PCI\GPU"], checks=2, delay=0) == ""
+    assert packages.version_in_place(pkg, [], checks=1) == ""      # périphérique inconnu : pas de conclusion

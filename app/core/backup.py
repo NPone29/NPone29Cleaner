@@ -28,6 +28,7 @@ inventaire : les fichiers supprimés entre-temps ne réapparaissent pas.
 from __future__ import annotations
 
 import ctypes
+import errno
 import fnmatch
 import gzip
 import json
@@ -55,6 +56,8 @@ MARKER = "_en_cours.json"
 SCRIPT = "RESTAURER.bat"
 README = "LISEZMOI.txt"
 CONTROL_FILES = (MANIFEST, INVENTORY, MARKER, SCRIPT)
+REPO_LOCK = "_verrou.lock"
+_LOCK_HELD = (errno.EACCES, errno.EAGAIN, errno.EDEADLK)   # « déjà verrouillé » (les autres erreurs : pas de verrou)
 
 FULL, DIFFERENTIAL, INCREMENTAL = "full", "differential", "incremental"
 KIND_LABELS = {FULL: "Complète", DIFFERENTIAL: "Différentielle", INCREMENTAL: "Incrémentale"}
@@ -71,6 +74,82 @@ _CLOUD_ATTRIBUTES = 0x00001000 | 0x00040000 | 0x00400000  # OFFLINE | RECALL_ON_
 CHUNK = 4 * 1024 * 1024
 FAT32_LIMIT = 4 * 1024 ** 3 - 1
 _PROGRESS_EVERY = 0.15  # secondes entre deux rafraîchissements de l'interface
+
+
+class RepoBusy(OSError):
+    """Une autre sauvegarde de ce PC écrit déjà dans ce dossier de sauvegarde."""
+
+
+class RepoLock:
+    """Verrou posé dans le dossier de sauvegarde lui-même (sur le disque de destination).
+
+    Il est partagé par tous les processus et tous les comptes Windows qui sauvegardent ce PC sur ce disque
+    (le verrou de `backup_schedule` est propre à chaque compte), et Windows le libère tout seul si le processus
+    s'arrête. Tant qu'une sauvegarde le tient, même PC en veille, personne ne supprime ses dossiers.
+    """
+
+    def __init__(self, repo: str | Path):
+        self.path = Path(repo) / REPO_LOCK
+        self._fd: int | None = None
+        # Verrou impossible sur ce disque (fichier non modifiable, lecteur réseau sans verrous…) : on continue
+        # sans lui, comme `BackupLock`, mais rien n'est alors supprimé automatiquement (`remove_incomplete`).
+        self.unavailable = False
+
+    def acquire(self) -> bool:
+        """False seulement si une autre sauvegarde tient déjà le verrou. True sinon, y compris quand le disque ne
+        permet pas de verrou (`unavailable`) : une sauvegarde ne doit pas être bloquée pour autant."""
+        if self._fd is not None or self.unavailable:
+            return True
+        try:
+            fd = os.open(long_path(self.path), os.O_RDWR | os.O_CREAT, 0o666)
+        except OSError as exc:
+            return self._without_lock(exc)
+        try:
+            if os.name == "nt":
+                import msvcrt
+
+                msvcrt.locking(fd, msvcrt.LK_NBLCK, 1)
+            else:  # pragma: no cover - l'application ne tourne que sous Windows
+                import fcntl
+
+                fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except OSError as exc:
+            os.close(fd)
+            if exc.errno in _LOCK_HELD:
+                return False
+            return self._without_lock(exc)
+        self._fd = fd
+        return True
+
+    def _without_lock(self, exc: OSError) -> bool:
+        log.warning("Verrou de sauvegarde impossible sur %s (%s) : on continue sans.", self.path.parent, exc)
+        self.unavailable = True
+        return True
+
+    def release(self) -> None:
+        if self._fd is None:
+            return
+        try:
+            os.lseek(self._fd, 0, os.SEEK_SET)
+            if os.name == "nt":
+                import msvcrt
+
+                msvcrt.locking(self._fd, msvcrt.LK_UNLCK, 1)
+        except OSError:
+            pass
+        finally:
+            os.close(self._fd)
+            self._fd = None
+            self.unavailable = False
+
+    def __enter__(self) -> "RepoLock":
+        if not self.acquire():
+            raise RepoBusy("Une autre sauvegarde de ce PC est en cours sur ce disque (depuis un autre compte "
+                           "Windows ?). Réessayez quand elle sera terminée.")
+        return self
+
+    def __exit__(self, *_exc) -> None:
+        self.release()
 
 
 class Cancelled(Exception):
@@ -628,7 +707,10 @@ def delete_set(repo: str | Path, set_id: str) -> None:
     target = Path(repo) / set_id
     if not ((target / MANIFEST).is_file() or (target / MARKER).is_file()):
         raise ValueError(f"« {target} » n'est pas une sauvegarde NPone29.")
+    _rmtree(target)
 
+
+def _rmtree(target: Path) -> None:
     def retry(func, path, _exc):
         _clear_readonly(path)
         func(path)
@@ -637,6 +719,79 @@ def delete_set(repo: str | Path, set_id: str) -> None:
         shutil.rmtree(long_path(target), onexc=retry)
     else:
         shutil.rmtree(long_path(target), onerror=retry)
+
+
+def find_incomplete(repo: str | Path) -> list[Path]:
+    """Dossiers de sauvegardes interrompues : marqueur « en cours » et pas de manifeste (jamais une sauvegarde
+    terminée, même si un de ses fichiers est illisible sur le moment)."""
+    try:
+        children = [c for c in Path(repo).iterdir() if c.is_dir()]
+    except OSError:
+        return []
+    found = []
+    for child in children:
+        try:
+            if (child / MARKER).is_file() and not os.path.lexists(child / MANIFEST):
+                found.append(child)
+        except OSError:
+            continue
+    return found
+
+
+def tree_size(path: Path) -> int:
+    """Octets occupés par un dossier (pour annoncer la place libérée)."""
+    total = 0
+    for root, _dirs, files in os.walk(long_path(path)):
+        for name in files:
+            try:
+                total += os.stat(os.path.join(root, name)).st_size
+            except OSError:
+                pass
+    return total
+
+
+def remove_incomplete(repo: str | Path) -> list[str]:
+    """Supprime les sauvegardes interrompues (disque plein, arrêt, PC éteint…). Renvoie les ids supprimés.
+
+    Elles ne peuvent pas être restaurées et occupent de la place : sans ce ménage, une sauvegarde automatique
+    interrompue par un disque plein bloquerait toutes les suivantes.
+
+    Prudence, car la suppression est définitive : rien n'est fait si une sauvegarde tient le verrou du dossier
+    (`RepoLock`, quel que soit le compte Windows, même PC en veille), et seuls les dossiers qui ont un marqueur
+    « en cours » et pas de manifeste sont concernés : une sauvegarde terminée n'est jamais supprimée, même si un
+    de ses fichiers est illisible sur le moment.
+    """
+    repo = Path(repo)
+    if not repo.is_dir():
+        return []
+    lock = RepoLock(repo)
+    if not lock.acquire():
+        log.info("Une sauvegarde est en cours dans %s : rien n'est supprimé.", repo)
+        return []
+    if lock.unavailable:
+        # Sans verrou, impossible de savoir si une sauvegarde (autre compte) écrit encore : on ne supprime rien.
+        # Les sauvegardes arrêtées proprement suppriment déjà leur copie partielle elles-mêmes.
+        log.info("Pas de verrou possible dans %s : sauvegardes interrompues laissées en place.", repo)
+        return []
+    removed: list[str] = []
+    try:
+        for child in find_incomplete(repo):
+            try:
+                delete_set(repo, child.name)
+                removed.append(child.name)
+                log.info("Sauvegarde interrompue supprimée : %s", child.name)
+            except (OSError, ValueError) as exc:
+                log.warning("Sauvegarde interrompue %s non supprimée : %s", child.name, exc)
+    finally:
+        lock.release()
+    return removed
+
+
+def delete_sets(repo: str | Path, set_ids: list[str]) -> None:
+    """Suppression demandée par l'utilisateur, refusée (RepoBusy) si une sauvegarde écrit dans ce dossier."""
+    with RepoLock(repo):
+        for set_id in set_ids:
+            delete_set(repo, set_id)
 
 
 def prune(repo: str | Path, keep_full: int) -> list[str]:
@@ -860,11 +1015,21 @@ def _copy_app(repo: Path) -> None:
 
 def run_backup(plan: BackupPlan, cancel: threading.Event | None = None,
                on_progress: Callable[[Progress], None] | None = None, keep_full: int = 0) -> BackupResult:
-    """Copie les fichiers prévus par `plan` dans une nouvelle sauvegarde."""
+    """Copie les fichiers prévus par `plan` dans une nouvelle sauvegarde.
+
+    Le verrou du dossier (`RepoLock`) est tenu du début à la fin : aucun autre processus ne peut supprimer cette
+    sauvegarde pendant qu'elle s'écrit. RepoBusy si une autre sauvegarde de ce PC écrit déjà sur ce disque.
+    """
+    plan.repo.mkdir(parents=True, exist_ok=True)
+    with RepoLock(plan.repo):
+        return _run_backup(plan, cancel, on_progress, keep_full)
+
+
+def _run_backup(plan: BackupPlan, cancel: threading.Event | None,
+                on_progress: Callable[[Progress], None] | None, keep_full: int) -> BackupResult:
     started = time.monotonic()
     when = datetime.now()
     repo = plan.repo
-    repo.mkdir(parents=True, exist_ok=True)
     set_id = _new_set_id(repo, plan.kind, when)
     set_dir = repo / set_id
     set_dir.mkdir()
@@ -921,11 +1086,27 @@ def run_backup(plan: BackupPlan, cancel: threading.Event | None = None,
                     inventory.pop(key, None)
             progress.done_files += 1
     except Cancelled:
+        # Une sauvegarde partielle ne peut pas être restaurée : on libère tout de suite la place qu'elle occupe
+        # (sinon `remove_incomplete` s'en charge au début de la prochaine sauvegarde).
+        try:
+            delete_set(repo, set_id)
+            result.path = None
+        except (OSError, ValueError) as exc:
+            log.warning("Sauvegarde interrompue %s non supprimée : %s", set_id, exc)
         result.cancelled = True
         result.duration = time.monotonic() - started
         report(force=True)
         return result
 
+    if not (set_dir / MARKER).is_file():
+        # Dossier supprimé pendant la copie (à la main, par exemple) : ne surtout pas l'annoncer comme une
+        # sauvegarde complète. Ce qui a été recopié depuis n'a plus de marqueur : l'application ne pourrait plus
+        # jamais le supprimer, on le fait tout de suite.
+        try:
+            _rmtree(set_dir)
+        except OSError as exc:
+            log.warning("Restes de la sauvegarde %s non supprimés : %s", set_id, exc)
+        raise OSError(f"La sauvegarde {set_id} a été supprimée pendant la copie : elle n'est pas valable.")
     requires = sorted({v[2] for v in inventory.values() if v[2] and v[2] != set_id})
     with gzip.open(set_dir / INVENTORY, "wt", encoding="utf-8") as fh:
         json.dump({"format": FORMAT_VERSION, "files": inventory}, fh, ensure_ascii=False, separators=(",", ":"))

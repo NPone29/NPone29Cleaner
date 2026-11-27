@@ -162,9 +162,131 @@ def test_cancelled_backup_is_not_used_as_reference(env):
     interrupted = backup.run_backup(plan, cancel)
     assert interrupted.cancelled
     sets = backup.list_sets(backup.repository_for(dest))
-    assert [s.complete for s in sets] == [True, False]
+    assert [s.complete for s in sets] == [True]                  # copie partielle supprimée tout de suite
+    assert not (backup.repository_for(dest) / interrupted.set_id).exists()
     plan = backup.plan_backup([str(src)], str(dest), INCREMENTAL)
     assert plan.reference.id == sets[0].id and list(plan.to_copy) == ["Documents/a.txt"]
+
+
+def _leftover_set(dest: Path, name: str = "2020-01-01_10h00_complete") -> Path:
+    """Sauvegarde interrompue brutalement (PC éteint, application fermée) : seul le marqueur existe."""
+    set_dir = backup.repository_for(dest) / name
+    _write(set_dir / "Documents" / "gros.bin", "x" * 1000)
+    (set_dir / backup.MARKER).write_text(json.dumps({"kind": FULL, "created": "2020-01-01T10:00:00",
+                                                     "complete": False}), encoding="utf-8")
+    return set_dir
+
+
+def test_remove_incomplete_keeps_finished_sets(env):
+    src, dest = env
+    done = _backup(src, dest, FULL)
+    leftover = _leftover_set(dest)
+    assert backup.remove_incomplete(backup.repository_for(dest)) == [leftover.name]
+    assert not leftover.exists()
+    assert [s.id for s in backup.list_sets(backup.repository_for(dest))] == [done.set_id]
+
+
+def test_remove_incomplete_spares_running_backup(env):
+    """Une sauvegarde tient le verrou du dossier (autre compte Windows, PC en veille…) : rien n'est supprimé."""
+    src, dest = env
+    running = _leftover_set(dest)
+    holder = backup.RepoLock(backup.repository_for(dest))
+    assert holder.acquire()
+    try:
+        assert backup.remove_incomplete(backup.repository_for(dest)) == []
+    finally:
+        holder.release()
+    assert running.exists()
+
+
+def test_remove_incomplete_never_deletes_a_finished_backup(env):
+    """Inventaire illisible sur le moment (disque réseau) : la sauvegarde paraît incomplète mais est terminée."""
+    src, dest = env
+    done = _backup(src, dest, FULL)
+    set_dir = backup.repository_for(dest) / done.set_id
+    (set_dir / backup.INVENTORY).rename(set_dir / "inventaire_cache")
+    assert not backup.list_sets(backup.repository_for(dest))[0].complete
+    assert backup.remove_incomplete(backup.repository_for(dest)) == []
+    assert set_dir.exists()
+
+
+def test_backup_and_delete_refused_while_another_backup_writes(env):
+    src, dest = env
+    done = _backup(src, dest, FULL)
+    repo = backup.repository_for(dest)
+    holder = backup.RepoLock(repo)
+    assert holder.acquire()
+    try:
+        with pytest.raises(backup.RepoBusy):
+            backup.run_backup(backup.plan_backup([str(src)], str(dest), FULL))
+        with pytest.raises(backup.RepoBusy):
+            backup.delete_sets(repo, [done.set_id])
+    finally:
+        holder.release()
+    assert [s.id for s in backup.list_sets(repo)] == [done.set_id]
+    backup.delete_sets(repo, [done.set_id])          # verrou libre : la suppression passe
+    assert not backup.list_sets(repo)
+
+
+def test_disk_without_locks_still_backs_up_but_never_auto_deletes(env, monkeypatch):
+    """Lecteur réseau qui refuse les verrous, ou _verrou.lock non modifiable : la sauvegarde ne doit pas être
+    bloquée (« une autre sauvegarde est en cours » à tort), mais rien n'est supprimé sans verrou."""
+    import errno
+    import msvcrt
+
+    src, dest = env
+    leftover = _leftover_set(dest)
+
+    def no_locking(fd, mode, nbytes):
+        raise OSError(errno.EINVAL, "verrous non pris en charge")
+
+    monkeypatch.setattr(msvcrt, "locking", no_locking)
+    result = _backup(src, dest, FULL)
+    assert result.set_id and not result.cancelled
+    assert backup.remove_incomplete(backup.repository_for(dest)) == []
+    assert leftover.exists()
+    backup.delete_sets(backup.repository_for(dest), [leftover.name])   # suppression demandée : autorisée
+    assert not leftover.exists()
+
+
+def test_unopenable_lock_file_does_not_block_backup(env, monkeypatch):
+    src, dest = env
+    real_open = backup.os.open
+
+    def refuse_lock_file(path, *args, **kwargs):
+        if str(path).endswith(backup.REPO_LOCK):
+            raise PermissionError(13, "Accès refusé", str(path))
+        return real_open(path, *args, **kwargs)
+
+    monkeypatch.setattr(backup.os, "open", refuse_lock_file)
+    assert not _backup(src, dest, FULL).cancelled
+
+
+def test_backup_deleted_during_copy_is_never_marked_complete(env, monkeypatch):
+    src, dest = env
+    real_copy = backup.copy_file
+
+    def copy_then_lose_marker(src_path, dst, cancel=None, on_bytes=None):
+        for marker in backup.repository_for(dest).glob("*/" + backup.MARKER):
+            marker.unlink()                          # dossier supprimé par quelqu'un pendant la copie
+        return real_copy(src_path, dst, cancel, on_bytes)
+
+    monkeypatch.setattr(backup, "copy_file", copy_then_lose_marker)
+    with pytest.raises(OSError):
+        backup.run_backup(backup.plan_backup([str(src)], str(dest), FULL))
+    assert not list(backup.repository_for(dest).glob("*/" + backup.MANIFEST))
+    # Les fichiers recopiés sans marqueur ne doivent pas rester sur le disque (l'application ne les verrait plus).
+    assert not [c for c in backup.repository_for(dest).iterdir() if c.is_dir()]
+
+
+def test_find_incomplete_lists_only_interrupted_sets(env):
+    src, dest = env
+    done = _backup(src, dest, FULL)
+    leftover = _leftover_set(dest)
+    repo = backup.repository_for(dest)
+    assert backup.find_incomplete(repo) == [leftover]
+    assert backup.tree_size(leftover) > 1000                 # gros.bin + marqueur
+    assert (repo / done.set_id).exists() and leftover.exists()   # rien n'est supprimé par la recherche
 
 
 def test_restore_original_location_does_not_overwrite_by_default(env):

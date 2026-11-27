@@ -210,3 +210,37 @@ def test_notify_structure_size():
 
     expected = 976 if ctypes.sizeof(ctypes.c_void_p) == 8 else 956
     assert ctypes.sizeof(notify.NOTIFYICONDATAW) == expected
+
+
+# --------------------------------------------------------------------------- Windows Update (sans vrai COM)
+
+def _fake_wu_session(*update_ids):
+    from types import SimpleNamespace
+
+    items = [SimpleNamespace(Identity=SimpleNamespace(UpdateID=u), Title=f"Pilote {u}") for u in update_ids]
+    updates = SimpleNamespace(Count=len(items), Item=lambda i: items[i])
+    searcher = SimpleNamespace(Online=False, Search=lambda criteria: SimpleNamespace(Updates=updates))
+    return SimpleNamespace(CreateUpdateSearcher=lambda: searcher)
+
+
+def test_abandoned_windows_update_thread_keeps_its_own_state():
+    """Après « Passer ce pilote », l'ancien thread qui finit sa recherche ne doit pas écrire dans l'état
+    (objets COM, résultats affichés) du nouveau thread."""
+    from app.core.drivers import WindowsUpdateDriverService
+
+    service = WindowsUpdateDriverService()
+    try:
+        old = service._state
+        old.session = _fake_wu_session("ancien")
+        service.abandon()
+        service._search(old)                         # l'ancien thread termine après l'abandon
+        assert list(old.updates) == ["ancien"]
+        assert service._state.updates == {} and service._state.session is None
+        assert service.last_results is None
+
+        service._state.session = _fake_wu_session("nouveau")
+        service._search(service._state)
+        assert [u.update_id for u in service.last_results] == ["nouveau"]
+        assert list(service._state.updates) == ["nouveau"]
+    finally:
+        service.shutdown()

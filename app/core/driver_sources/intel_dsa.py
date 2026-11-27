@@ -229,6 +229,11 @@ def to_package(c: Candidate) -> packages.VendorPackage:
         advice="Installateur Intel : suivez ses étapes (« Installer », puis « Fermer » ou « Redémarrer »).")
 
 
+def launchable(url: str) -> bool:
+    """Fichier qu'on peut vérifier (signature Windows) puis lancer : .exe ou .msi. Pas une archive .zip."""
+    return url.lower().split("?", 1)[0].endswith((".exe", ".msi"))
+
+
 def make_check(dev: DeviceRef, c: Candidate, now: datetime, attempts: dict[str, dict] | None = None) -> VendorCheck:
     latest = c.component.version
     order = compare_versions(latest, dev.version)
@@ -240,13 +245,19 @@ def make_check(dev: DeviceRef, c: Candidate, now: datetime, attempts: dict[str, 
         newer, generic = False, True
         note = ("Ce pilote Intel a déjà été installé une fois, mais Windows a gardé votre pilote actuel (celui du "
                 "fabricant de votre PC est prioritaire).")
+    elif newer and not launchable(c.file.url):
+        # Ex. « Wired_driver_31.3_x64.zip » : une archive n'a pas de signature Windows et ne se lance pas ;
+        # l'installation automatique échouait à chaque fois (« fichier supprimé par sécurité »).
+        note = ("Intel ne fournit ce pilote que sous forme d'archive ZIP : téléchargez-le avec le lien ci-dessous, "
+                "décompressez-le puis lancez l'installateur qu'il contient.")
     elif newer and c.component.category == "Graphics":
         note = ("Pilote générique d'Intel : sur certains PC portables, le fabricant du PC recommande sa propre "
                 "version.")
+    auto = newer and launchable(c.file.url)
     return VendorCheck(
         source=SOURCE_LABEL, latest_version=latest, update_available=newer, checked_at=now,
         title=c.package.name, release_date=c.package.date, page_url=c.package.page_url,
-        download_url=c.file.url, extra=to_package(c) if newer else None, comparable=True, note=note,
+        download_url=c.file.url, extra=to_package(c) if auto else None, comparable=True, note=note,
         generic_newer=generic)
 
 

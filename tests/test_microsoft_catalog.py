@@ -357,3 +357,53 @@ def test_to_ref_carries_windows_ids():
     ms = driver_analysis.to_ref(installed("Caméra", "USB\\VID_0408&PID_A061\\6&1", "10.0.1", None,
                                           provider="Microsoft", cls="Camera"))
     assert not mc.MicrosoftCatalogSource().applies_to_device(ms)   # pilote de Windows : suivi par Windows Update
+
+
+# --------------------------------------------------------------------------- résultat d'une installation
+
+def _install_with(monkeypatch, tmp_path, returncode, output, versions_seen):
+    """Installe un faux pilote du catalogue : pnputil renvoie (returncode, output), puis chaque relecture de la
+    version du périphérique renvoie l'élément suivant de `versions_seen`."""
+    from app.core import drivers
+    from app.utils.system import CommandResult
+
+    cab, folder = tmp_path / "p.cab", tmp_path / "extrait"
+    cab.write_bytes(b"")
+    folder.mkdir()
+    seen = iter(versions_seen)
+    monkeypatch.setattr(mc, "download_and_extract", lambda *a, **k: (cab, folder))
+    monkeypatch.setattr(drivers, "install_inf_folder", lambda *a, **k: CommandResult(returncode, output, ""))
+    monkeypatch.setattr(drivers, "driver_version_of", lambda ids: {r"pci\dev": (next(seen), None)})
+    monkeypatch.setattr(mc, "APPLY_CHECK_DELAY", 0)
+    not_applied = []
+    monkeypatch.setattr(mc, "remember_not_applied", lambda drv: not_applied.append(drv.update_id))
+    drv = mc.CatalogDriver(update_id="u1", title="INTEL - System", version="10.1.37.7", date="07/18/1968",
+                           architecture="AMD64", products="Windows 11")
+    return mc.install(drv, [r"PCI\DEV"]), not_applied
+
+
+def test_install_waits_for_windows_to_switch_driver(monkeypatch, tmp_path):
+    """Realtek du 27/11 : pnputil réussit, mais la nouvelle version n'apparaît qu'après quelques secondes."""
+    out, not_applied = _install_with(monkeypatch, tmp_path, 0, "Package de pilotes installé",
+                                     ["6.0.9900.1", "6.0.9900.1", "10.1.37.7"])
+    assert out.success and not out.reboot_required and not not_applied
+
+
+def test_install_with_code_259_and_restart_message_is_a_success(monkeypatch, tmp_path):
+    """Intel du 27/11 : code 259 (un des paquets sans périphérique) et redémarrage annoncé, message mal décodé."""
+    output = "Packages de pilotes ajoutÚs : 2\nLa finalisation des opÚrations nÚcessite un redÚmarrage systÞme."
+    out, not_applied = _install_with(monkeypatch, tmp_path, 259, output, ["10.1.37.5"] * 10)
+    assert out.success and out.reboot_required and not not_applied
+
+
+def test_install_kept_by_windows_is_remembered(monkeypatch, tmp_path):
+    out, not_applied = _install_with(monkeypatch, tmp_path, 259, "Aucun périphérique mis à jour", ["10.1.37.5"] * 10)
+    assert not out.success and not_applied == ["u1"]
+
+
+def test_registry_driver_date_is_month_day_year():
+    from app.core.drivers import _registry_date
+
+    assert _registry_date("4-7-2026") == datetime(2026, 4, 7)      # DriverVer=04/07/2026 (7 avril)
+    assert _registry_date("7-18-1968") == datetime(1968, 7, 18)
+    assert _registry_date("") is None and _registry_date("n'importe quoi") is None

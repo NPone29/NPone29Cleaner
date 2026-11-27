@@ -30,6 +30,21 @@ def _set_app_user_model_id() -> None:
         pass
 
 
+def _use_windows_certificates(log: logging.Logger) -> None:
+    """Fait vérifier les certificats HTTPS par Windows plutôt que par Python.
+
+    Python ne connaît que les certificats racines déjà présents sur le PC ; Windows télécharge ceux qui manquent
+    (ex. le certificat récent de dsadata.intel.com : « CERTIFICATE_VERIFY_FAILED » sans cela). Même niveau de
+    sécurité : c'est la vérification du système, celle du navigateur.
+    """
+    try:
+        import truststore
+
+        truststore.inject_into_ssl()
+    except Exception as exc:  # paquet absent ou incompatible : vérification standard de Python
+        log.warning("Vérification des certificats par Windows indisponible (%s)", exc)
+
+
 def main() -> int:
     if sys.platform != "win32":
         print("NPone29 Cleaner fonctionne uniquement sous Windows.")
@@ -41,6 +56,7 @@ def main() -> int:
     setup_logging(debug="--debug" in sys.argv)
     log = logging.getLogger("main")
     log.info("Démarrage de %s %s", APP_NAME, APP_VERSION)
+    _use_windows_certificates(log)
 
     if "--backup" in sys.argv:
         # Sauvegarde automatique (tâche planifiée) : aucune fenêtre. --force : sauvegarde même si non due.

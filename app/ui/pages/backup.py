@@ -755,8 +755,21 @@ class BackupPage(Page):
         self._set_busy(True)
         self.status.busy("Analyse des dossiers…")
         progress = self.dispatcher.wrap(lambda p: self.status.set_text(_progress_text(p)))
-        self.dispatcher.run(backup.plan_backup, sources, dest, self._current_mode(), None, self.cancel, progress,
-                            on_done=lambda plan: self._confirm_backup(plan, check),
+        mode, cancel = self._current_mode(), self.cancel
+
+        repo = backup.repository_for(dest)
+
+        def plan() -> tuple[BackupPlan, int, int]:
+            # Les sauvegardes interrompues ne sont supprimées qu'après le « Oui » de l'utilisateur (leurs fichiers
+            # déjà copiés restent récupérables à la main d'ici là) : on se contente de les compter.
+            leftovers = backup.find_incomplete(repo)
+            leftover_bytes = sum(backup.tree_size(p) for p in leftovers)
+            return backup.plan_backup(sources, dest, mode, None, cancel, progress), len(leftovers), leftover_bytes
+
+        def planned(out: tuple[BackupPlan, int, int]) -> None:
+            self._confirm_backup(out[0], check, out[1], out[2])
+
+        self.dispatcher.run(plan, on_done=planned,
                             on_error=self._backup_error, on_finally=self._after_plan)
 
     def _after_plan(self) -> None:
@@ -765,7 +778,8 @@ class BackupPage(Page):
             self._lock.release()
             self._set_busy(False)
 
-    def _confirm_backup(self, plan: BackupPlan, check: DestinationCheck) -> None:
+    def _confirm_backup(self, plan: BackupPlan, check: DestinationCheck, leftovers: int = 0,
+                        leftover_bytes: int = 0) -> None:
         self.status.idle("")
         lines = [f"Type : {KIND_LABELS[plan.kind]}"]
         lines += [f"  {note}" for note in plan.notes]
@@ -779,6 +793,12 @@ class BackupPage(Page):
             free = check.free
         if free is not None:
             lines.append(f"Place libre sur la destination : {human_size(free)}")
+        if leftovers:
+            lines.append(f"\n{leftovers} sauvegarde(s) interrompue(s) ({human_size(leftover_bytes)}) seront supprimées "
+                         "avant la copie : elles ne peuvent pas être restaurées. Répondez Non pour les garder "
+                         "(leurs fichiers déjà copiés restent récupérables à la main).")
+            if free is not None:
+                free += leftover_bytes      # place rendue par cette suppression
         if plan.cloud_skipped:
             lines.append(f"\n{_count(plan.cloud_skipped)} fichier(s) OneDrive « en ligne uniquement » ignorés "
                          "(ils sont déjà dans le cloud).")
@@ -801,8 +821,14 @@ class BackupPage(Page):
         self.status.progress(0, "Copie des fichiers…")
         progress = self.dispatcher.wrap(lambda p: self.status.progress(p.fraction, _progress_text(p)))
         keep = KEEP_CHOICES.get(self.keep.get(), 0)
-        self.dispatcher.run(backup.run_backup, plan, self.cancel, progress, keep,
-                            on_done=lambda r: self._backup_done(plan, r), on_error=self._backup_error,
+        cancel = self.cancel
+
+        def run() -> BackupResult:
+            if leftovers:
+                backup.remove_incomplete(plan.repo)     # accepté par l'utilisateur dans la question ci-dessus
+            return backup.run_backup(plan, cancel, progress, keep)
+
+        self.dispatcher.run(run, on_done=lambda r: self._backup_done(plan, r), on_error=self._backup_error,
                             on_finally=self._after_copy)
 
     def _after_copy(self) -> None:
@@ -821,7 +847,9 @@ class BackupPage(Page):
         if result.cancelled:
             reason = ("Le disque de sauvegarde est plein." if result.disk_full
                       else "Sauvegarde arrêtée à votre demande.")
-            self.status.idle(f"{reason} La sauvegarde incomplète peut être supprimée dans l'onglet « Restaurer ».")
+            cleaned = ("La copie partielle a été supprimée." if result.path is None else
+                       "La copie partielle sera supprimée au début de la prochaine sauvegarde.")
+            self.status.idle(f"{reason} {cleaned}")
             self.app.notify("Sauvegarde interrompue", reason, "warning")
             self.repo = None
             return
@@ -1099,15 +1127,35 @@ class BackupPage(Page):
         RestoreDialog(self, backup_set, count, lambda mode, folder, overwrite:
                       self._run_restore(backup_set, keys, mode, folder, overwrite))
 
+    def _take_lock(self) -> bool:
+        """Verrou des sauvegardes, pour restaurer, vérifier ou supprimer : la sauvegarde automatique ne doit pas
+        écrire dans (ou supprimer) une sauvegarde utilisée au même moment."""
+        if self._lock.acquire():
+            return True
+        show_info(self, "Sauvegarde en cours",
+                  "Une sauvegarde automatique est en cours en arrière-plan.\n\nRéessayez dans quelques minutes.")
+        return False
+
+    def _release_lock(self) -> None:
+        self._lock.release()
+        self._set_busy(False)
+
     def _run_restore(self, backup_set: BackupSet, keys: list[str] | None, mode: str, folder: str,
                      overwrite: bool) -> None:
+        if self.busy or not self._take_lock():
+            return
         self.cancel.clear()
         self._set_busy(True)
         self.status.progress(0, "Restauration…")
         progress = self.dispatcher.wrap(lambda p: self.status.progress(p.fraction, _progress_text(p)))
-        self.dispatcher.run(backup.restore, self.repo, backup_set.id, mode, folder, overwrite, keys, self.cancel,
-                            progress, on_done=lambda r: self._restore_done(r, mode, folder),
-                            on_error=self._backup_error, on_finally=lambda: self._set_busy(False))
+        repo, cancel = self.repo, self.cancel
+
+        def work() -> RestoreResult:
+            with backup.RepoLock(repo):     # aucune sauvegarde (autre compte) ne supprime ce qu'on restaure
+                return backup.restore(repo, backup_set.id, mode, folder, overwrite, keys, cancel, progress)
+
+        self.dispatcher.run(work, on_done=lambda r: self._restore_done(r, mode, folder),
+                            on_error=self._backup_error, on_finally=self._release_lock)
 
     def _restore_done(self, result: RestoreResult, mode: str, folder: str) -> None:
         problems = len(result.errors) + len(result.missing)
@@ -1147,13 +1195,20 @@ class BackupPage(Page):
         if not backup_set.complete:
             show_warning(self, "Sauvegarde interrompue", "Cette sauvegarde est incomplète : supprimez-la.")
             return
+        if not self._take_lock():
+            return
         self.cancel.clear()
         self._set_busy(True)
         self.status.progress(0, "Vérification…")
         progress = self.dispatcher.wrap(lambda p: self.status.progress(p.fraction, _progress_text(p)))
-        self.dispatcher.run(backup.verify, self.repo, backup_set.id, self.cancel, progress,
-                            on_done=lambda r: self._verify_done(backup_set, r), on_error=self._backup_error,
-                            on_finally=lambda: self._set_busy(False))
+        repo, cancel = self.repo, self.cancel
+
+        def work() -> VerifyResult:
+            with backup.RepoLock(repo):
+                return backup.verify(repo, backup_set.id, cancel, progress)
+
+        self.dispatcher.run(work, on_done=lambda r: self._verify_done(backup_set, r), on_error=self._backup_error,
+                            on_finally=self._release_lock)
 
     def _verify_done(self, backup_set: BackupSet, result: VerifyResult) -> None:
         if result.cancelled:
@@ -1192,16 +1247,18 @@ class BackupPage(Page):
                         f"supprimées aussi :\n{others}")
         if not ask_yes_no(self, "Supprimer", message):
             return
+        if self.busy or not self._take_lock():
+            return
         repo = self.repo
         self._set_busy(True)
         self.status.busy("Suppression…")
 
         def work() -> None:
-            for s in doomed:
-                backup.delete_set(repo, s.id)
+            # Refusé si une sauvegarde (même d'un autre compte Windows) écrit dans ce dossier.
+            backup.delete_sets(repo, [s.id for s in doomed])
 
         def finished() -> None:
-            self._set_busy(False)
+            self._release_lock()
             self.load_repository(repo)
 
         self.dispatcher.run(work, on_done=lambda _r: self.status.idle(f"{len(doomed)} sauvegarde(s) supprimée(s)."),

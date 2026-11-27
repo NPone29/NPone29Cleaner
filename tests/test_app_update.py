@@ -36,6 +36,18 @@ def test_versions():
     assert not app_update.is_newer("nimporte-quoi", "1.3.0")
 
 
+def test_prerelease_numbers_compare_as_numbers():
+    assert app_update.is_newer("1.4.0-beta.10", "1.4.0-beta.9")
+    assert not app_update.is_newer("1.4.0-beta.9", "1.4.0-beta.10")
+    assert app_update.is_newer("1.4.0-rc.10", "1.4.0-rc.2")
+    assert app_update.is_newer("1.4.0-rc.1", "1.4.0-beta.12")       # rc après bêta
+    assert app_update.is_newer("1.4.0-beta2", "1.4.0-beta1")
+    assert app_update.is_newer("1.4.0", "1.4.0-rc.10")
+    assert app_update.parse_version("v1.5.0-beta²") is not None      # « ² » n'est pas un nombre : pas de plantage
+    assert app_update.is_prerelease_version("1.4.0-beta.10")
+    assert not app_update.is_prerelease_version("1.4.0")
+
+
 def test_pick_latest_stable_release():
     found = app_update.pick_update([release("v1.3.1"), release("v1.5.0", draft=True), release("v1.4.0"),
                                     release("v1.2.0")], current="1.3.0")
@@ -119,6 +131,10 @@ def test_installer_command_waits_for_app_and_relaunches(tmp_path):
     assert cmd[0].endswith("setup.exe")
     assert "/SILENT" in cmd and "/RELAUNCH=1" in cmd and "/CLOSEAPPLICATIONS" in cmd
     assert cmd[-1] == "/WAITPID=123,456"
+
+    ready = tmp_path / "setup.exe.pret"
+    cmd = app_update.installer_command(tmp_path / "setup.exe", [123], ready)
+    assert cmd[-2] == "/WAITPID=123" and cmd[-1] == f"/READYFILE={ready}"
 
 
 def test_wheel_scrolls_like_a_browser():

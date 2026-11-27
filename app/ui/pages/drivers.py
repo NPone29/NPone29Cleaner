@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import logging
 import threading
+import time
 import tkinter.font as tkfont
 from concurrent.futures import TimeoutError as FutureTimeout
 
@@ -31,6 +32,9 @@ TABS = ["Analyse complète", "Windows Update", "Pilotes installés", "Périphér
 STEPS = ["Analyser", "Vérifier", "Mettre à jour", "Terminé"]
 DETAIL_MAX_LINES = 5     # lignes de description visibles sous la liste par défaut (le reste défile)
 DETAIL_LINES_RANGE = (2, 20)
+# Après « Passer ce pilote » (Windows Update), attente maximale de la fin de l'installation abandonnée avant
+# de lancer la suivante : Windows Update n'en fait qu'une à la fois.
+WU_ABANDON_WAIT = 90
 STATUS_TAGS = {
     driver_analysis.PROBLEM: ("error",), driver_analysis.UPDATE: ("warn",),
     driver_analysis.VENDOR_UPDATE: ("warn",), driver_analysis.GENERIC: ("warn",),
@@ -65,6 +69,8 @@ class DriversPage(Page):
         self.busy = False
         self.cancel = threading.Event()                   # tout arrêter
         self._current_skip: threading.Event | None = None  # passer le pilote en cours d'installation
+        self._vendor_installer_open = False                 # installateur NVIDIA/Intel ouvert (non interruptible)
+        self.busy_pending = False      # étape suivante programmée (installateurs officiels) : la page reste occupée
         self._loaded_installed = False
         self._loaded_problems = False
         self._pending_refresh = False    # actualiser dès que l'opération en cours se termine
@@ -136,7 +142,15 @@ class DriversPage(Page):
             self.install_controls.grid(row=4, column=0, sticky="w", pady=(8, 0))
         else:
             self._current_skip = None
+            self._vendor_installer_open = False
             self.install_controls.grid_remove()
+
+    def _set_vendor_installer_open(self, is_open: bool) -> None:
+        """Installateur du fabricant ouvert (NVIDIA, Intel) : on ne peut pas l'interrompre depuis l'application,
+        seulement empêcher les suivants de s'ouvrir."""
+        self._vendor_installer_open = is_open
+        if not self.cancel.is_set():
+            self.skip_btn.configure(state="disabled" if is_open else "normal")
 
     def _skip_current(self) -> None:
         current = self._current_skip
@@ -152,15 +166,19 @@ class DriversPage(Page):
             self.status.set_text("Interruption du pilote en cours…")
 
     def _stop_all(self) -> None:
-        if not ask_yes_no(self, "Tout arrêter",
-                          "Interrompre le pilote en cours et ne pas installer les suivants ?"):
+        vendor_open = self._vendor_installer_open
+        question = ("Ne pas lancer les installateurs suivants ?\n\nL'installateur ouvert ne peut pas être "
+                    "interrompu d'ici : terminez-le ou fermez sa fenêtre." if vendor_open else
+                    "Interrompre le pilote en cours et ne pas installer les suivants ?")
+        if not ask_yes_no(self, "Tout arrêter", question):
             return
         self.cancel.set()
         if self._current_skip is not None:
             self._current_skip.set()
         self.skip_btn.configure(state="disabled")
         self.stop_btn.configure(state="disabled")
-        self.status.set_text("Arrêt de l'installation…")
+        self.status.set_text("Arrêt demandé : les installateurs suivants ne seront pas lancés. Fermez celui qui est "
+                             "ouvert pour terminer." if vendor_open else "Arrêt de l'installation…")
 
     # ================================================================== ANALYSE COMPLÈTE
     def _build_analysis_tab(self) -> ctk.CTkFrame:
@@ -544,27 +562,69 @@ class DriversPage(Page):
             self._current_skip = skip
             return skip
 
+        def wait_until_done(future, limit: float = WU_ABANDON_WAIT) -> bool:
+            """Attend la fin d'une installation abandonnée ; False si elle tourne encore (ou arrêt demandé)."""
+            deadline = time.monotonic() + limit
+            while time.monotonic() < deadline and not cancel.is_set():
+                if future.done():
+                    return True
+                time.sleep(0.5)
+            return future.done()
+
         def install_windows_update() -> InstallReport:
-            skip = new_skip()
-            partial = InstallReport()      # rempli au fur et à mesure par le thread Windows Update
-            future = service.install(wu_ids, wu_progress, skip, partial)
+            # Un pilote à la fois : « Passer ce pilote » n'abandonne que celui en cours, pas les suivants.
+            wu = InstallReport()
+            total = len(wu_ids)
             error = ""
-            while True:
-                try:
-                    future.result(timeout=0.5)
+            for n, update_id in enumerate(wu_ids, start=1):
+                if cancel.is_set() or error:
                     break
-                except FutureTimeout:
-                    if skip.is_set():
-                        # Installation bloquée : on l'abandonne (l'appel Windows continue seul) et on passe
-                        # aux pilotes suivants.
-                        service.abandon()
+                abandoned = None
+                skip = new_skip()
+                partial = InstallReport()      # rempli au fur et à mesure par le thread Windows Update
+
+                def on_progress(_index: int, _total: int, title: str, phase: str, n=n) -> None:
+                    wu_progress(n, total, title, phase)
+
+                future = service.install([update_id], on_progress, skip, partial)
+                while True:
+                    try:
+                        future.result(timeout=0.5)
                         break
-                except Exception as exc:
-                    error = drivers.com_error_message(exc)
-                    break
-            wu = InstallReport(list(partial.outcomes), partial.reboot_required)
+                    except FutureTimeout:
+                        if skip.is_set():
+                            # Installation bloquée : on l'abandonne (l'appel Windows continue seul) et on passe
+                            # au pilote suivant.
+                            service.abandon()
+                            abandoned = future
+                            break
+                    except Exception as exc:
+                        error = drivers.com_error_message(exc)
+                        break
+                wu.outcomes.extend(partial.outcomes)
+                wu.reboot_required |= partial.reboot_required
+                if not any(o.update_id == update_id for o in partial.outcomes):
+                    reason = error or ("Arrêt demandé" if cancel.is_set() else "Passé : installation interrompue")
+                    wu.outcomes.append(InstallOutcome(update_id, known.get(update_id, update_id), False, reason))
+                # Aussi après le dernier pilote Windows Update si des pilotes du Catalogue suivent : Windows
+                # n'installe qu'un pilote à la fois, quelle que soit la source.
+                if abandoned is not None and (n < total or catalog) and not cancel.is_set():
+                    # Windows Update n'installe qu'un pilote à la fois : tant que l'installation abandonnée
+                    # tourne encore, les suivantes échoueraient ou resteraient bloquées à leur tour.
+                    busy("Windows Update : attente de la fin du pilote interrompu…")
+                    if not wait_until_done(abandoned):
+                        if cancel.is_set():
+                            break           # « Tout arrêter » pendant l'attente : les suivants sont « Arrêt demandé »
+                        error = ("Passé : Windows Update est encore occupé par le pilote interrompu (réessayez "
+                                 "après un redémarrage)")
+                    else:
+                        # Terminée entre-temps : son vrai résultat remplace « Passé ».
+                        late = [o for o in partial.outcomes if o.update_id == update_id]
+                        if late:
+                            wu.outcomes = [o for o in wu.outcomes if o.update_id != update_id] + late
+                            wu.reboot_required |= partial.reboot_required
             done = {o.update_id for o in wu.outcomes}
-            reason = error or ("Arrêt demandé" if cancel.is_set() else "Passé : installation interrompue")
+            reason = error or "Arrêt demandé"
             wu.outcomes += [InstallOutcome(i, known.get(i, i), False, reason) for i in wu_ids if i not in done]
             return wu
 
@@ -619,6 +679,7 @@ class DriversPage(Page):
         if pkgs:
             # Les installateurs officiels viennent en dernier : ils sont interactifs.
             self.status.idle(f"{summary} Préparation des installateurs officiels…")
+            self.busy_pending = True
             self.after(150, lambda: self._run_installers(pkgs, report))
             return
         self.stepper.set(len(STEPS))
@@ -663,10 +724,11 @@ class DriversPage(Page):
         `previous` : bilan des pilotes installés juste avant (« Tout mettre à jour »), repris dans le bilan final.
         La liste des pilotes est actualisée à la fin, pour afficher les versions réellement en place.
         """
-        if not pkgs:
-            return
         if self.busy:       # l'opération précédente se termine : on réessaie juste après
             self.after(500, lambda: self._run_installers(pkgs, previous))
+            return
+        self.busy_pending = False    # l'étape commence : `busy` prend le relais
+        if not pkgs:
             return
         report = previous or InstallReport()
         queue = list(pkgs)
@@ -681,6 +743,7 @@ class DriversPage(Page):
         progress = self.dispatcher.wrap(self.status.progress)
         busy = self.dispatcher.wrap(self.status.busy)
         notify = self.dispatcher.wrap(self.app.notify)
+        installer_open = self.dispatcher.wrap(self._set_vendor_installer_open)
 
         def work() -> InstallReport:
             for n, pkg in enumerate(queue, start=1):
@@ -715,15 +778,28 @@ class DriversPage(Page):
                      "fermeture.")
                 notify(f"Installateur {pkg.vendor} ouvert",
                        "Suivez ses étapes : la liste des pilotes sera actualisée à sa fermeture.", "info")
-                code = launch_and_wait(path)
+                installer_open(True)
+                try:
+                    code = launch_and_wait(path)
+                finally:
+                    installer_open(False)
                 try:
                     path.unlink(missing_ok=True)     # parfois plusieurs centaines de Mo, inutile une fois installé
                 except OSError:
                     pass
+                log.info("Installateur %s fermé : code %s", pkg.title, code)
+                in_place = "" if code is None or code in packages.SUCCESS_CODES else \
+                    packages.version_in_place(pkg, [key for key, _old in concerned.get(pkg.key, [])])
                 if code is None:
                     report.outcomes.append(InstallOutcome(pkg.key, pkg.title, False,
                                                           "L'installateur n'a pas pu être lancé (autorisation "
                                                           "refusée ?)."))
+                elif in_place:
+                    # Code inhabituel, mais le nouveau pilote est bien utilisé : c'est une réussite.
+                    report.outcomes.append(InstallOutcome(pkg.key, pkg.title, True,
+                                                          f"installé : version {in_place} en place (fichier vérifié, "
+                                                          f"signé par {pkg.publisher})"))
+                    packages.remember_install(pkg, concerned.get(pkg.key, []))
                 elif code in packages.SUCCESS_CODES:
                     report.reboot_required |= code in packages.REBOOT_CODES
                     report.outcomes.append(InstallOutcome(pkg.key, pkg.title, True,
