@@ -620,7 +620,9 @@ def download_and_extract(drv: CatalogDriver, progress=None, cancel=None, phase=N
         if phase:
             phase("vérification de l'empreinte et de la signature Microsoft…")
         if digest:
-            actual = base64.b64encode(hashlib.sha256(path.read_bytes()).digest()).decode("ascii")
+            from app.core.packages import file_hash     # lecture par blocs : les .cab font parfois 700 Mo
+
+            actual = base64.b64encode(bytes.fromhex(file_hash(path, "sha256"))).decode("ascii")
             if actual != digest:
                 raise CatalogInstallError("Empreinte du fichier différente de celle annoncée par Microsoft : "
                                           "installation annulée par sécurité.")
@@ -652,6 +654,11 @@ class CatalogInstallOutcome:
     reboot_required: bool = False
 
 
+_RESTART_HINT = re.compile(r"red.marrage|reboot|restart", re.IGNORECASE)
+APPLY_CHECKS = 6            # relectures de la version après pnputil…
+APPLY_CHECK_DELAY = 2.0     # …espacées de 2 s
+
+
 def install(drv: CatalogDriver, device_ids: list[str], progress=None, cancel=None,
             phase=None, title: str = "") -> CatalogInstallOutcome:
     """Installe un pilote du catalogue (droits administrateur requis) puis vérifie qu'il est bien utilisé.
@@ -678,14 +685,21 @@ def install(drv: CatalogDriver, device_ids: list[str], progress=None, cancel=Non
         return CatalogInstallOutcome(title, False, "Passé : installation interrompue (redémarrez le PC si le "
                                                    "périphérique ne fonctionne plus correctement).")
     log.info("pnputil (%s) : code %s\n%s", drv.title, result.returncode, result.output[-2000:])
-    reboot = result.returncode == 3010
-    try:
-        now = drivers.driver_version_of(device_ids)
-    except Exception:
-        log.warning("Version installée illisible après l'installation", exc_info=True)
-        now = {}
-    applied = any(v.strip() == drv.version.strip() or compare_versions(v, drv.version) in (0, 1)
-                  for v, _date in now.values())
+    # pnputil ne renvoie pas toujours 3010 : avec plusieurs paquets dont un sans périphérique, il renvoie 259 tout
+    # en annonçant le redémarrage nécessaire (message traduit, et parfois mal décodé : « redÚmarrage »).
+    reboot = result.returncode == 3010 or bool(_RESTART_HINT.search(result.output or ""))
+    applied = False
+    for attempt in range(APPLY_CHECKS):
+        try:
+            now = drivers.driver_version_of(device_ids)
+        except Exception:
+            log.warning("Version installée illisible après l'installation", exc_info=True)
+            now = {}
+        applied = any(v.strip() == drv.version.strip() or compare_versions(v, drv.version) in (0, 1)
+                      for v, _date in now.values())
+        if applied or attempt == APPLY_CHECKS - 1:
+            break
+        time.sleep(APPLY_CHECK_DELAY)       # Windows met parfois quelques secondes à associer le nouveau pilote
     if applied:
         return CatalogInstallOutcome(title, True, "Installé" + (" — redémarrage nécessaire" if reboot else ""),
                                      reboot)

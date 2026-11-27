@@ -244,6 +244,34 @@ def test_busy_when_another_backup_runs(env):
     assert not backup.list_sets(backup.repository_for(str(dest)))
 
 
+def test_interrupted_backup_is_cleaned_before_next_run(env):
+    """Une sauvegarde coupée (disque plein, PC éteint) ne doit pas occuper la place des suivantes."""
+    src, dest, status, lock = env
+    leftover = backup.repository_for(str(dest)) / "2020-01-01_10h00_complete"
+    leftover.mkdir(parents=True)
+    (leftover / "gros.bin").write_bytes(b"x" * 1000)
+    (leftover / backup.MARKER).write_text('{"kind": "full", "complete": false}', encoding="utf-8")
+    outcome, _ = _run(_settings(dest, [src]), status, lock, force=True)
+    assert outcome.action == bs.OK
+    assert not leftover.exists()
+    assert [s.complete for s in backup.list_sets(backup.repository_for(str(dest)))] == [True]
+
+
+def test_busy_when_another_account_writes_on_the_disk(env):
+    """Verrou du dossier de sauvegarde tenu (autre compte Windows) : pas d'alerte d'erreur, on réessaiera."""
+    src, dest, status, lock = env
+    repo = backup.repository_for(str(dest))
+    repo.mkdir(parents=True)
+    holder = backup.RepoLock(repo)
+    assert holder.acquire()
+    try:
+        outcome, notes = _run(_settings(dest, [src]), status, lock, force=True)
+    finally:
+        holder.release()
+    assert outcome.action == "busy" and outcome.code == 0 and not notes
+    assert not backup.list_sets(repo)
+
+
 def test_failure_exit_code_and_single_alert(env):
     src, dest, status, lock = env
     settings = _settings(dest, [], backup_sources=[])

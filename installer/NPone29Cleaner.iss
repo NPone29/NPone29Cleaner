@@ -72,7 +72,7 @@ Filename: "{sys}\schtasks.exe"; Parameters: "/Delete /TN ""{#BackupTask}"" /F"; 
 french.FinishedLabel=L'installation de [name] est terminée.%n%nVos réglages et vos sauvegardes sont conservés lors des mises à jour et de la désinstallation.
 
 [Code]
-// Mise à jour lancée depuis l'application : /SILENT /RELAUNCH=1 /WAITPID=<pid>,<pid>
+// Mise à jour lancée depuis l'application : /SILENT /RELAUNCH=1 /WAITPID=<pid>,<pid> /READYFILE=<fichier>
 const
   SYNCHRONIZE = $00100000;
   WAIT_SECONDS = 90;
@@ -124,8 +124,20 @@ begin
   end;
 end;
 
+// Prévient l'application que les droits administrateur sont obtenus : elle peut se fermer. Si l'élévation
+// est refusée, ce code ne s'exécute jamais et l'application reste ouverte.
+procedure SignalReady;
+var
+  ReadyFile: String;
+begin
+  ReadyFile := ExpandConstant('{param:READYFILE|}');
+  if ReadyFile <> '' then
+    SaveStringToFile(ReadyFile, 'ok', False);
+end;
+
 function InitializeSetup: Boolean;
 begin
+  SignalReady;
   WaitForApplication;
   Result := True;
 end;

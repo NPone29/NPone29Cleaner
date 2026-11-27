@@ -6,6 +6,8 @@ import logging
 import os
 import sys
 import threading
+import time
+import tkinter as tk
 import tkinter.font as tkfont
 import traceback
 
@@ -52,6 +54,19 @@ NAVIGATION: list[tuple[str, str, str, type[Page]]] = [
     ("bigfiles", "Gros fichiers", "", BigFilesPage),
     ("tools", "Outils", "", ToolsPage),
 ]
+
+def _remove_files(*paths) -> None:
+    for path in paths:
+        if path is None:
+            continue
+        try:
+            path.unlink(missing_ok=True)
+        except OSError:
+            pass
+
+
+UAC_TIMEOUT = 5 * 60           # au-delà, la demande d'autorisation de l'installateur est abandonnée
+LATE_START_WATCH = 10 * 60     # surveillance d'une autorisation donnée malgré tout après l'abandon
 
 APPEARANCES = {"Sombre": "dark", "Clair": "light", "Système": "system"}
 
@@ -102,12 +117,77 @@ class UpdateBanner(ctk.CTkFrame):
             self._set_buttons(("Annuler", self.window.cancel_update, ""))
         self.bar.set(done / total if total else 0)
 
+    def show_ready(self, busy: list[str]) -> None:
+        """Téléchargée pendant une opération : l'installation attend un clic (jamais de fermeture surprise)."""
+        self._downloading = False
+        self.bar.pack_forget()
+        self.label.configure(text=f"Version {self.release.version} prête : installez-la quand l'opération en cours "
+                                  f"sera terminée ({', '.join(busy)}). L'application se fermera puis se rouvrira.")
+        self._set_buttons(("Installer maintenant", self.window.install_ready_update, "primary"),
+                          ("Annuler", self.window.discard_ready_update, ""))
+
     def show_installing(self) -> None:
         self._downloading = False
         self.bar.pack_forget()
         self._set_buttons()
-        self.label.configure(text=f"Installation de la version {self.release.version} : l'application va se "
-                                  "fermer puis se rouvrir toute seule…")
+        self.label.configure(text=f"Installation de la version {self.release.version} : autorisez-la dans la "
+                                  "fenêtre de Windows, puis l'application se fermera et se rouvrira toute seule…")
+
+
+class InstallerWaitDialog(ctk.CTkToplevel):
+    """Fenêtre modale pendant la demande d'autorisation (UAC) de l'installateur.
+
+    Elle capture le clavier et la souris de toute l'application (y compris les fenêtres ouvertes par les pages) :
+    aucune opération ne peut démarrer, puisque l'application se ferme dès que l'autorisation est donnée.
+    """
+
+    def __init__(self, window: "MainWindow", version: str, on_cancel):
+        super().__init__(window)
+        self._previous_grab = window.grab_current()    # dialogue de page modal, rendu modal à la fermeture
+        self._grab_tries = 0
+        self.withdraw()
+        self.title("Mise à jour de NPone29 Cleaner")
+        self.configure(fg_color=theme.WINDOW_BG)
+        self.resizable(False, False)
+        self.transient(window)
+        self.protocol("WM_DELETE_WINDOW", on_cancel)
+        body = ctk.CTkFrame(self, fg_color="transparent")
+        body.pack(fill="both", expand=True, padx=24, pady=20)
+        ctk.CTkLabel(body, text=f"Installation de la version {version}", font=theme.font(15, "bold"),
+                     anchor="w").pack(fill="x")
+        ctk.CTkLabel(body, text="Autorisez l'installation dans la fenêtre de Windows qui vient de s'ouvrir (elle "
+                                "est peut-être derrière cette fenêtre, ou clignote dans la barre des tâches).\n\n"
+                                "L'application se fermera ensuite et se rouvrira toute seule.",
+                     font=theme.font(12), justify="left", anchor="w", wraplength=420).pack(fill="x", pady=(8, 0))
+        neutral_button(body, "Annuler", on_cancel, width=110).pack(anchor="e", pady=(16, 0))
+        self.update_idletasks()
+        x = window.winfo_rootx() + (window.winfo_width() - self.winfo_reqwidth()) // 2
+        y = window.winfo_rooty() + (window.winfo_height() - self.winfo_reqheight()) // 3
+        self.geometry(f"+{max(0, x)}+{max(0, y)}")
+        self.deiconify()
+        self._grab()
+
+    def destroy(self) -> None:
+        previous = self._previous_grab
+        super().destroy()
+        if previous is not None:
+            try:
+                if previous.winfo_exists():
+                    previous.grab_set()
+            except tk.TclError:
+                pass
+
+    def _grab(self) -> None:
+        if not self.winfo_exists():
+            return
+        try:
+            self.lift()
+            self.grab_set()         # remplace la capture d'un éventuel dialogue de page
+            self.focus_force()
+        except tk.TclError:         # fenêtre pas encore affichée : on réessaie (pas indéfiniment)
+            self._grab_tries += 1
+            if self._grab_tries < 50:
+                self.after(100, self._grab)
 
 
 class NavItem(ctk.CTkFrame):
@@ -180,6 +260,8 @@ class MainWindow(ctk.CTk):
         self.banner_area = ctk.CTkFrame(self.content, fg_color="transparent")
         self.update_banner: UpdateBanner | None = None
         self._update_cancel: threading.Event | None = None
+        self._ready_installer = None      # installateur téléchargé, en attente d'un clic (opération en cours)
+        self._installer = None            # installateur lancé : (processus, fichier « prêt », fenêtre, échéance)
         if not self.admin:
             self._build_admin_banner()
 
@@ -377,8 +459,8 @@ class MainWindow(ctk.CTk):
 
     def _show_update_banner(self, release: Release) -> None:
         if self.update_banner is not None:
-            if self._update_cancel is not None:
-                return     # téléchargement en cours
+            if self._update_cancel is not None or self._ready_installer is not None or self._installer is not None:
+                return     # téléchargement ou installation en cours
             self.update_banner.destroy()
         self._show_banner_area()
         self.update_banner = UpdateBanner(self.banner_area, self, release)
@@ -400,9 +482,12 @@ class MainWindow(ctk.CTk):
                                        "depuis la page Outils.", "info")
 
     def _busy_pages(self) -> list[str]:
+        """Pages occupées. `busy_pending` : la page va enchaîner une autre étape (elle n'est pas « libre » entre
+        les deux, même si `busy` repasse brièvement à False)."""
         labels = {pid: label for pid, label, _g, _c in NAVIGATION}
         return [labels.get(pid, pid) for pid, page in self.pages.items()
-                if getattr(page, "busy", False) or getattr(page, "running", False)]
+                if getattr(page, "busy", False) or getattr(page, "running", False)
+                or getattr(page, "busy_pending", False)]
 
     def install_update(self, release: Release) -> None:
         kind = app_update.install_kind()
@@ -444,15 +529,117 @@ class MainWindow(ctk.CTk):
             self._update_cancel.set()
 
     def _launch_update(self, path) -> None:
-        self._update_cancel = None
+        """Téléchargement terminé. Si une opération a démarré entre-temps (sauvegarde, pilotes…), on ne la coupe
+        pas : le bandeau propose d'installer quand elle sera finie, sur un clic de l'utilisateur."""
+        from app.utils.download import DownloadCancelled
+
+        cancel, self._update_cancel = self._update_cancel, None
+        if cancel is not None and cancel.is_set():     # « Annuler » cliqué juste à la fin du téléchargement
+            path.unlink(missing_ok=True)
+            self._update_failed(DownloadCancelled())
+            return
+        busy = self._busy_pages()
+        if busy:
+            self._ready_installer = path
+            if self.update_banner is not None:
+                self.update_banner.show_ready(busy)
+            return
+        self._start_installer(path)
+
+    def install_ready_update(self) -> None:
+        path = self._ready_installer
+        if path is None:
+            return
+        busy = self._busy_pages()
+        if busy:
+            show_warning(self, "Opération en cours",
+                         f"Attendez la fin de l'opération en cours ({', '.join(busy)}) avant d'installer la mise "
+                         "à jour : l'application va se fermer.")
+            return
+        self._ready_installer = None
+        self._start_installer(path)
+
+    def discard_ready_update(self) -> None:
+        path, self._ready_installer = self._ready_installer, None
+        if path is not None:
+            path.unlink(missing_ok=True)
+        if self.update_banner is not None:
+            self.update_banner.show_available()
+
+    def _start_installer(self, path) -> None:
         if self.update_banner is not None:
             self.update_banner.show_installing()
         try:
-            app_update.launch_installer(path)
+            process, ready = app_update.launch_installer(path)
         except OSError as exc:
             self._update_failed(exc)
             return
-        self.after(1500, self._exit_for_update)
+        version = self.update_banner.release.version if self.update_banner is not None else ""
+        dialog = InstallerWaitDialog(self, version, lambda: self._abandon_installer(timeout=False))
+        self._installer = (process, ready, dialog, time.monotonic() + UAC_TIMEOUT, path)
+        self._poll_installer()
+
+    def _poll_installer(self) -> None:
+        """Ne ferme l'application qu'une fois l'installateur passé administrateur : en cas de refus de l'UAC,
+        rien ne la rouvrirait."""
+        if self._installer is None:
+            return
+        process, ready, dialog, deadline, path = self._installer
+        if ready.exists():
+            self._exit_for_update()
+            return
+        if process.poll() is not None:
+            log.warning("Installateur terminé sans avoir démarré (code %s)", process.returncode)
+            self._installer = None
+            dialog.destroy()
+            _remove_files(path, ready)      # rien ne tourne : l'installateur téléchargé ne sert plus
+            self._update_failed(app_update.UpdateError(
+                "L'installation n'a pas démarré : l'autorisation administrateur a peut-être été refusée."))
+            return
+        if time.monotonic() > deadline:
+            self._abandon_installer(timeout=True)
+            return
+        self.after(300, self._poll_installer)
+
+    def _abandon_installer(self, timeout: bool) -> None:
+        """« Annuler », ou autorisation jamais donnée : l'application redevient utilisable."""
+        from app.utils.download import DownloadCancelled
+
+        if self._installer is None:
+            return
+        process, ready, dialog, _deadline, path = self._installer
+        self._installer = None
+        dialog.destroy()
+        try:
+            process.kill()
+        except OSError:
+            pass
+        log.warning("Installation de la mise à jour abandonnée (%s)", "délai dépassé" if timeout else "annulée")
+        self._watch_late_start(ready, time.monotonic() + LATE_START_WATCH, path)
+        self._update_failed(app_update.UpdateError("L'autorisation n'a pas été donnée à temps : installation "
+                                                   "annulée.") if timeout else DownloadCancelled())
+
+    def _watch_late_start(self, ready, until: float, path=None) -> None:
+        """Si l'autorisation est finalement donnée (demande restée ouverte), l'installateur tourne quand même et
+        fermerait l'application de force au bout de 90 s : mieux vaut la fermer proprement tout de suite."""
+        if ready.exists():
+            busy = self._busy_pages()
+            if busy:
+                # Jamais de fermeture surprise au milieu d'une opération : l'installateur attend lui-même la
+                # fermeture de l'application (puis la demande à Windows).
+                log.warning("Installateur démarré malgré l'annulation, opération en cours (%s) : pas de fermeture "
+                            "forcée", ", ".join(busy))
+                self.notify("Mise à jour en attente", "L'installation a été autorisée : fermez l'application à la "
+                            "fin de l'opération en cours pour la terminer.", "warning")
+                return
+            log.warning("Installateur démarré malgré l'annulation : fermeture pour la mise à jour")
+            self._exit_for_update()
+        elif time.monotonic() < until and self._installer is None:
+            self.after(1000, lambda: self._watch_late_start(ready, until, path))
+        else:
+            # L'installateur n'a jamais démarré : le fichier téléchargé (quelques dizaines de Mo) ne sert plus.
+            # Il est gardé pendant la surveillance, car un installateur autorisé tardivement le lit encore.
+            _remove_files(path, ready)
 
     def _exit_for_update(self) -> None:
         """Ferme l'application tout de suite : l'installateur attend sa fin pour remplacer le .exe."""

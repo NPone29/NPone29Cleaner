@@ -510,6 +510,7 @@ def run_scheduled(force: bool = False, settings=None, status_file: Path | None =
             return _failed(status, status_file, now, notify, "Aucun dossier à sauvegarder n'est sélectionné.")
 
         repo = backup.repository_for(cfg.destination)
+        backup.remove_incomplete(repo)      # une sauvegarde interrompue ne doit pas bloquer les suivantes
         try:
             sets = backup.list_sets(repo)
         except OSError:
@@ -530,6 +531,9 @@ def run_scheduled(force: bool = False, settings=None, status_file: Path | None =
                                f"{human_size(free)} libres. Libérez de la place ou réduisez « Sauvegardes complètes "
                                "à conserver ».")
             result = backup.run_backup(plan, keep_full=cfg.keep_full)
+        except backup.RepoBusy:
+            log.info("Une autre sauvegarde de ce PC écrit sur ce disque (autre compte Windows) : rien à faire.")
+            return RunOutcome(0, "busy")
         except (OSError, ValueError) as exc:
             log.exception("Sauvegarde automatique impossible")
             return _failed(status, status_file, now, notify, str(exc))

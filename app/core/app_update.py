@@ -64,7 +64,7 @@ class Release:
 # --------------------------------------------------------------------------- versions
 
 def parse_version(text: str) -> tuple | None:
-    """« v1.4.0 » -> ((1, 4, 0), (1,)) ; « 1.4.0-beta.2 » -> ((1, 4, 0), (0, 'beta.2')). None si illisible.
+    """« v1.4.0 » -> ((1, 4, 0), (1,)) ; « 1.4.0-beta.2 » -> ((1, 4, 0), (0, (1, 'beta'), (0, 2))). None si illisible.
 
     Une pré-version (bêta, rc…) passe avant la version finale du même numéro.
     """
@@ -74,7 +74,17 @@ def parse_version(text: str) -> tuple | None:
     numbers = tuple(int(n) for n in match.group(1).split("."))
     numbers = numbers + (0,) * (3 - len(numbers)) if len(numbers) < 3 else numbers
     suffix = match.group(2)
-    return numbers, ((0, suffix.lower()) if suffix else (1,))
+    return numbers, ((0, *_suffix_key(suffix)) if suffix else (1,))
+
+
+def _suffix_key(suffix: str) -> tuple:
+    """« beta.10 » -> ((1, 'beta'), (0, 10)) : les numéros se comparent comme des nombres (beta.10 après beta.9).
+
+    L'étiquette 0/1 de chaque partie est indispensable : sans elle, « 1.0.0-2 » contre « 1.0.0-beta » comparerait
+    un int à une str (TypeError).
+    """
+    return tuple((0, int(part)) if part.isdecimal() else (1, part)
+                 for part in re.split(r"[.\-]|(?<=\D)(?=\d)|(?<=\d)(?=\D)", suffix.lower()) if part)
 
 
 def is_newer(candidate: str, current: str = APP_VERSION) -> bool:
@@ -227,21 +237,31 @@ def own_processes() -> list[int]:
     return pids
 
 
-def installer_command(path: Path, wait_pids: list[int]) -> list[str]:
-    return [str(path), *INSTALLER_ARGS, "/WAITPID=" + ",".join(str(p) for p in wait_pids)]
+def installer_command(path: Path, wait_pids: list[int], ready_file: Path | None = None) -> list[str]:
+    command = [str(path), *INSTALLER_ARGS, "/WAITPID=" + ",".join(str(p) for p in wait_pids)]
+    if ready_file is not None:
+        command.append(f"/READYFILE={ready_file}")
+    return command
 
 
-def launch_installer(path: Path, wait_pids: list[int] | None = None) -> None:
+def launch_installer(path: Path, wait_pids: list[int] | None = None) -> tuple[subprocess.Popen, Path]:
     """Lance l'installateur en mode silencieux.
 
-    Il attend la fermeture de l'application (`wait_pids`), remplace ses fichiers puis la rouvre ; en cas
-    d'échec, il rouvre l'ancienne version.
+    Il demande les droits administrateur (UAC), attend la fermeture de l'application (`wait_pids`), remplace
+    ses fichiers puis la rouvre ; en cas d'échec, il rouvre l'ancienne version.
+
+    Renvoie le processus lancé et le fichier « prêt » que l'installateur crée une fois les droits administrateur
+    obtenus : l'application ne doit se fermer qu'à ce moment-là. Si le processus se termine avant que ce fichier
+    n'apparaisse, l'élévation a été refusée et rien ne rouvrirait l'application.
     """
     DETACHED_PROCESS = 0x00000008
     CREATE_NEW_PROCESS_GROUP = 0x00000200
-    command = installer_command(path, own_processes() if wait_pids is None else wait_pids)
-    subprocess.Popen(command, close_fds=True, creationflags=DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP)
+    ready = path.with_name(path.name + ".pret")
+    ready.unlink(missing_ok=True)
+    command = installer_command(path, own_processes() if wait_pids is None else wait_pids, ready)
+    process = subprocess.Popen(command, close_fds=True, creationflags=DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP)
     log.info("Installateur lancé : %s", subprocess.list2cmdline(command))
+    return process, ready
 
 
 def short_notes(notes: str, limit: int = 700) -> str:
