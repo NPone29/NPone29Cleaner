@@ -33,6 +33,7 @@ class SoftwarePage(Page):
         self._position = (0, 0)                       # (index, total) de la mise à jour en cours
         self._logged = 0                              # messages winget déjà écrits dans le journal
         self._window: int | None = None               # fenêtre de l'installateur à afficher
+        self._summary = ""                            # bilan des mises à jour, repris après l'actualisation
 
         self.grid_columnconfigure(0, weight=1)
         self.grid_rowconfigure(4, weight=3)
@@ -284,7 +285,7 @@ class SoftwarePage(Page):
             return ok, fail, skipped
 
         self.dispatcher.run(work, on_done=self._upgrade_done, on_error=self._upgrade_error,
-                            on_finally=lambda: self._set_busy(False))
+                            on_finally=self._upgrade_finished)
 
     def _on_progress(self, done: int, total: int, item: SoftwareUpdate, result) -> None:
         row = [item.name, item.id, item.version, item.available]
@@ -324,13 +325,39 @@ class SoftwarePage(Page):
     def _upgrade_error(self, exc: BaseException) -> None:
         self._reset_pending_rows()
         self.stepper.set(1)
-        self.status.idle(f"Erreur : {exc}. Vous pouvez relancer la mise à jour de la sélection.")
+        self._summary = f"Erreur : {exc}."
+        self.status.idle(f"{self._summary} Vous pouvez relancer la mise à jour de la sélection.")
+
+    def _upgrade_finished(self) -> None:
+        self._set_busy(False)
+        self._refresh_after_upgrade()   # aussi après une erreur : une partie a peut-être été mise à jour
+
+    def _refresh_after_upgrade(self) -> None:
+        """Relance la recherche winget après les mises à jour : la liste n'affiche plus que les logiciels
+        qui ont réellement encore une mise à jour (réussies retirées, échecs et passées toujours proposés)."""
+        if self.busy:
+            return
+        summary = self._summary
+        self._set_busy(True)
+        self.status.busy(f"{summary} Actualisation de la liste des logiciels…")
+
+        def done(updates: list[SoftwareUpdate]) -> None:
+            self.show_updates(updates, notify=False)
+            remaining = (f"Il reste {len(updates)} logiciel(s) à mettre à jour (cochés ci-dessus)." if updates
+                         else "✓ Tous vos logiciels sont à jour.")
+            self.status.idle(f"{summary} {remaining}")
+
+        self.dispatcher.run(software.list_upgrades, on_done=done,
+                            on_error=lambda e: self.status.idle(f"{summary} Actualisation de la liste impossible : "
+                                                                f"{e}. Cliquez sur « Rechercher » pour réessayer."),
+                            on_finally=lambda: self._set_busy(False))
 
     def _upgrade_done(self, counts: tuple[int, int, int]) -> None:
         ok, fail, skipped = counts
         self._reset_pending_rows()
         stopped = " Arrêt demandé : les logiciels restants n'ont pas été mis à jour." if self.cancel.is_set() else ""
-        self.status.idle(f"Terminé : {ok} mis à jour, {fail} échec(s), {skipped} passé(s).{stopped}")
+        self._summary = f"Terminé : {ok} mis à jour, {fail} échec(s), {skipped} passé(s).{stopped}"
+        self.status.idle(self._summary)
         self.stepper.set(len(STEPS))
         self.app.notify("Mises à jour terminées", f"{ok} logiciel(s) mis à jour, {fail} échec(s).",
                         "success" if not fail else "warning")
@@ -339,9 +366,9 @@ class SoftwarePage(Page):
             tips.append("Un échec vient souvent d'un logiciel ouvert pendant la mise à jour : fermez-le et réessayez.")
             tips.append("Certains logiciels (ex. Microsoft Store, jeux) se mettent à jour par eux-mêmes.")
         if skipped:
-            tips.append("Les mises à jour passées restent cochées : vous pourrez les relancer plus tard.")
+            tips.append("Les mises à jour passées restent proposées : vous pourrez les relancer plus tard.")
+        tips.append("La liste s'actualise automatiquement pour n'afficher que les logiciels encore à mettre à jour.")
         stats = [("Réussies", str(ok)), ("Échecs", str(fail))] + ([("Passées", str(skipped))] if skipped else [])
         ResultDialog(self, "Mises à jour terminées", f"{ok} logiciel(s) mis à jour", stats, tips,
-                     actions=[("Relancer la recherche", self.start_search),
-                              ("Vérifier les pilotes", lambda: self.app.show_page("drivers").start_analysis())],
+                     actions=[("Vérifier les pilotes", lambda: self.app.show_page("drivers").start_analysis())],
                      level="success" if not fail else "warning")
