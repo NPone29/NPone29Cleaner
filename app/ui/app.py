@@ -55,6 +55,15 @@ NAVIGATION: list[tuple[str, str, str, type[Page]]] = [
     ("tools", "Outils", "", ToolsPage),
 ]
 
+BUSY_FLAGS = ("busy", "running", "busy_pending")
+
+
+def page_is_busy(page) -> bool:
+    """La page a une opération en cours. On compare à True : depuis Python 3.13, tout widget tkinter a une
+    méthode `busy` (commande Tk « busy »), toujours « vraie », sur les pages qui ne définissent pas la leur."""
+    return any(getattr(page, flag, False) is True for flag in BUSY_FLAGS)
+
+
 def _remove_files(*paths) -> None:
     for path in paths:
         if path is None:
@@ -485,9 +494,7 @@ class MainWindow(ctk.CTk):
         """Pages occupées. `busy_pending` : la page va enchaîner une autre étape (elle n'est pas « libre » entre
         les deux, même si `busy` repasse brièvement à False)."""
         labels = {pid: label for pid, label, _g, _c in NAVIGATION}
-        return [labels.get(pid, pid) for pid, page in self.pages.items()
-                if getattr(page, "busy", False) or getattr(page, "running", False)
-                or getattr(page, "busy_pending", False)]
+        return [labels.get(pid, pid) for pid, page in self.pages.items() if page_is_busy(page)]
 
     def install_update(self, release: Release) -> None:
         kind = app_update.install_kind()
